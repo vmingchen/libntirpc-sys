@@ -1,0 +1,12 @@
+[package]
+name = "libntirpc-sys"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ming Chen <v.mingchen@gmail.com>"]
+description = "Low-level bindings for the libntirpc library."
+repository = "https://github.com/vmingchen/libntirpc-sys"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.70"
