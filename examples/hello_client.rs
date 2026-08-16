@@ -36,8 +36,12 @@ unsafe extern "C" fn svc_req_free(req: *mut svc_req, _stat: xprt_stat) {
 }
 
 fn main() {
-    let name = std::env::args().nth(1).unwrap_or_else(|| "world".to_string());
-    let host = std::env::args().nth(2).unwrap_or_else(|| "127.0.0.1".to_string());
+    let name = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "world".to_string());
+    let host = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     let name_c = CString::new(name).unwrap();
     let host_c = CString::new(host).unwrap();
