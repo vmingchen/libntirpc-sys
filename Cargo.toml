@@ -1,7 +1,7 @@
 [package]
 name = "libntirpc-sys"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Ming Chen <v.mingchen@gmail.com>"]
 license = "BSD-3-Clause"
 description = "Low-level bindings for the libntirpc library."
@@ -12,7 +12,7 @@ keywords = ["xdr", "rpc", "tirpc", "ntirpc"]
 [dependencies]
 
 [build-dependencies]
-bindgen = "0.70"
+bindgen = "0.72"
 
 [dev-dependencies]
 libc = "0.2"

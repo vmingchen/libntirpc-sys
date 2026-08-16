@@ -25,20 +25,22 @@ const HELLO_VERS: rpcvers_t = 1;
 /// bindgen emits `xdr_wrapstring` with the concrete argument type
 /// `*mut *mut c_char`, so wrap it with the generic `xdrproc_t` signature.
 unsafe extern "C" fn wrap_string(xdrs: *mut XDR, arg: *mut c_void) -> bool {
-    xdr_wrapstring(xdrs, arg as *mut *mut c_char)
+    unsafe { xdr_wrapstring(xdrs, arg as *mut *mut c_char) }
 }
 
 /// ntirpc calls `alloc_cb` to allocate a request for each incoming call.
 /// It requires the request to be zeroed and the transport/XDR set.
 unsafe extern "C" fn svc_req_alloc(xprt: *mut SVCXPRT, xdrs: *mut XDR) -> *mut svc_req {
-    let req = libc::calloc(1, std::mem::size_of::<svc_req>()) as *mut svc_req;
-    (*req).rq_xprt = xprt;
-    (*req).rq_xdrs = xdrs;
-    req
+    unsafe {
+        let req = libc::calloc(1, std::mem::size_of::<svc_req>()) as *mut svc_req;
+        (*req).rq_xprt = xprt;
+        (*req).rq_xdrs = xdrs;
+        req
+    }
 }
 
 unsafe extern "C" fn svc_req_free(req: *mut svc_req, _stat: xprt_stat) {
-    libc::free(req as *mut c_void);
+    unsafe { libc::free(req as *mut c_void) }
 }
 
 /// The dispatch registered with `svc_reg` is only used for bookkeeping;
@@ -48,48 +50,52 @@ unsafe extern "C" fn hello_dispatch(_req: *mut svc_req) {}
 /// Called by ntirpc for every incoming call (via `process_cb`). The client
 /// sends its name as a string and receives "Hello, <name>!" back.
 unsafe extern "C" fn hello_process(req: *mut svc_req) -> xprt_stat {
-    // ntirpc does not authenticate requests itself; the server must call
-    // svc_auth_authenticate() to set up req->rq_auth. Without it, rq_auth is
-    // NULL and svc_sendreply() skips the auth wrap, which is what actually
-    // encodes the result body (so the client would get an empty reply).
-    let mut no_dispatch = false;
-    if svc_auth_authenticate(req, &mut no_dispatch) != auth_stat_AUTH_OK {
-        return xprt_stat_XPRT_IDLE;
-    }
+    unsafe {
+        // ntirpc does not authenticate requests itself; the server must call
+        // svc_auth_authenticate() to set up req->rq_auth. Without it, rq_auth is
+        // NULL and svc_sendreply() skips the auth wrap, which is what actually
+        // encodes the result body (so the client would get an empty reply).
+        let mut no_dispatch = false;
+        if svc_auth_authenticate(req, &mut no_dispatch) != auth_stat_AUTH_OK {
+            return xprt_stat_XPRT_IDLE;
+        }
 
-    let mut name: *mut c_char = std::ptr::null_mut();
+        let mut name: *mut c_char = std::ptr::null_mut();
 
-    if !xdr_wrapstring((*req).rq_xdrs, &mut name) {
-        // Could not decode the argument; tell the client about it.
-        (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = Some(xdr_void);
-        (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ = std::ptr::null_mut();
+        if !xdr_wrapstring((*req).rq_xdrs, &mut name) {
+            // Could not decode the argument; tell the client about it.
+            (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = Some(xdr_void);
+            (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ = std::ptr::null_mut();
+            svc_sendreply(req);
+            return xprt_stat_XPRT_IDLE;
+        }
+        let name_c = std::ffi::CStr::from_ptr(name);
+        let reply_c = CString::new(format!("Hello, {}!", name_c.to_string_lossy())).unwrap();
+        libc::free(name as *mut c_void);
+
+        // Prepare the reply. svc_sendreply() encodes the result synchronously,
+        // so pointing at the reply string on the stack is fine.
+        let mut reply_ptr: *mut c_char = reply_c.as_ptr() as *mut c_char;
+        (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = Some(wrap_string);
+        (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ =
+            &mut reply_ptr as *mut *mut c_char as *mut c_void;
+
         svc_sendreply(req);
-        return xprt_stat_XPRT_IDLE;
+        xprt_stat_XPRT_IDLE
     }
-    let name_c = std::ffi::CStr::from_ptr(name);
-    let reply_c = CString::new(format!("Hello, {}!", name_c.to_string_lossy())).unwrap();
-    libc::free(name as *mut c_void);
-
-    // Prepare the reply. svc_sendreply() encodes the result synchronously,
-    // so pointing at the reply string on the stack is fine.
-    let mut reply_ptr: *mut c_char = reply_c.as_ptr() as *mut c_char;
-    (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = Some(wrap_string);
-    (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ =
-        &mut reply_ptr as *mut *mut c_char as *mut c_void;
-
-    svc_sendreply(req);
-    xprt_stat_XPRT_IDLE
 }
 
 /// Called by ntirpc when the first datagram arrives on the listening socket
 /// (and a new per-peer transport has been allocated). Hook up the request
 /// handler for that transport and process the buffered datagram.
 unsafe extern "C" fn udp_rendezvous(xprt: *mut SVCXPRT) -> xprt_stat {
-    (*xprt).xp_dispatch.__bindgen_anon_1.process_cb = Some(hello_process);
-    let recv = (*(*xprt).xp_ops).xp_recv;
-    match recv {
-        Some(f) => f(xprt),
-        None => xprt_stat_XPRT_DIED,
+    unsafe {
+        (*xprt).xp_dispatch.__bindgen_anon_1.process_cb = Some(hello_process);
+        let recv = (*(*xprt).xp_ops).xp_recv;
+        match recv {
+            Some(f) => f(xprt),
+            None => xprt_stat_XPRT_DIED,
+        }
     }
 }
 

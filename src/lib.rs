@@ -8,6 +8,10 @@
 #![allow(unnecessary_transmutes)]
 #![allow(improper_ctypes)]
 #![allow(improper_ctypes_definitions)]
+// Edition 2024 makes unsafe_op_in_unsafe_fn deny-by-default, which the
+// bindgen-generated bitfield helpers trip on.
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::ptr_offset_with_cast)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 pub type rpcblist = rp__list;

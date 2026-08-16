@@ -19,20 +19,22 @@ const HELLO_PROC: rpcproc_t = 1;
 /// bindgen emits `xdr_wrapstring` with the concrete argument type
 /// `*mut *mut c_char`, so wrap it with the generic `xdrproc_t` signature.
 unsafe extern "C" fn wrap_string(xdrs: *mut XDR, arg: *mut c_void) -> bool {
-    xdr_wrapstring(xdrs, arg as *mut *mut c_char)
+    unsafe { xdr_wrapstring(xdrs, arg as *mut *mut c_char) }
 }
 
 /// Client replies are processed by the same request machinery as server
 /// calls, so the request alloc/free callbacks are required on the client too.
 unsafe extern "C" fn svc_req_alloc(xprt: *mut SVCXPRT, xdrs: *mut XDR) -> *mut svc_req {
-    let req = libc::calloc(1, std::mem::size_of::<svc_req>()) as *mut svc_req;
-    (*req).rq_xprt = xprt;
-    (*req).rq_xdrs = xdrs;
-    req
+    unsafe {
+        let req = libc::calloc(1, std::mem::size_of::<svc_req>()) as *mut svc_req;
+        (*req).rq_xprt = xprt;
+        (*req).rq_xdrs = xdrs;
+        req
+    }
 }
 
 unsafe extern "C" fn svc_req_free(req: *mut svc_req, _stat: xprt_stat) {
-    libc::free(req as *mut c_void);
+    unsafe { libc::free(req as *mut c_void) }
 }
 
 fn main() {
