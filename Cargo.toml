@@ -13,3 +13,6 @@ keywords = ["xdr", "rpc", "tirpc", "ntirpc"]
 
 [build-dependencies]
 bindgen = "0.70"
+
+[dev-dependencies]
+libc = "0.2"

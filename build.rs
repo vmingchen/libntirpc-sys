@@ -17,7 +17,7 @@ fn run<P: AsRef<Path>>(mut cmd: Command, path: P) {
 fn download_and_extract() {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg("git clone https://github.com/nfs-ganesha/ntirpc.git");
+        .arg("git clone --recursive https://github.com/nfs-ganesha/ntirpc.git");
     run(cmd, "");
 }
 
@@ -64,12 +64,10 @@ fn main() {
         LIBNTIRPC_INSTALL_DIR.display()
     );
     println!("cargo:rustc-link-lib=dylib=ntirpc");
+    println!("cargo:rustc-link-lib=dylib=ntirpcmonitoring");
 
     bindgen::Builder::default()
-        .header(format!(
-            "{}/include/ntirpc/rpc/rpc.h",
-            LIBNTIRPC_INSTALL_DIR.display()
-        ))
+        .header(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wrapper.h"))
         .clang_arg(format!(
             "-I{}/include/ntirpc",
             LIBNTIRPC_INSTALL_DIR.display()
