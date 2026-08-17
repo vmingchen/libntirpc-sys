@@ -38,12 +38,24 @@ fn configure() {
 }
 
 fn make() {
-    let cmd = Command::new("make");
+    let mut cmd = Command::new("make");
+    cmd.arg(format!(
+        "-j{}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    ));
     run(cmd, &*LIBNTIRPC_BUILD_DIR);
 }
 
 fn install() {
     let mut cmd = Command::new("make");
+    cmd.arg(format!(
+        "-j{}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    ));
     cmd.arg("install");
     run(cmd, &*LIBNTIRPC_BUILD_DIR);
 }
@@ -65,6 +77,16 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=dylib=ntirpc");
     println!("cargo:rustc-link-lib=dylib=ntirpcmonitoring");
+
+    // Expose the ntirpc include directory to dependent crates via the `links`
+    // mechanism (DEP_NTIRPC_INCLUDE build-script env var).
+    println!(
+        "cargo:include={}/include/ntirpc",
+        LIBNTIRPC_INSTALL_DIR.display()
+    );
+    // The installed config.h includes "ntirpc/version.h", which is only
+    // resolvable from the build tree; expose that too (DEP_NTIRPC_INCLUDE2).
+    println!("cargo:include2={}", LIBNTIRPC_BUILD_DIR.display());
 
     bindgen::Builder::default()
         .header(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wrapper.h"))

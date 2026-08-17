@@ -1,7 +1,8 @@
 [package]
 name = "libntirpc-sys"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
+links = "ntirpc"
 authors = ["Ming Chen <v.mingchen@gmail.com>"]
 license = "BSD-3-Clause"
 description = "Low-level bindings for the libntirpc library."
