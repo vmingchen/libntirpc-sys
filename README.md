@@ -24,11 +24,12 @@ from source, which requires the following tools and libraries:
 | git | `git` | clone libntirpc (with submodules) |
 | clang | `clang` | provide the headers used by bindgen to generate bindings |
 | liburcu | `liburcu-dev` | userspace RCU library used by libntirpc |
+| libkrb5 | `libkrb5-dev` | RPCSEC_GSS support, required by libntirpc (GSS is on by default) |
 
 Install them on Ubuntu with:
 
 ```sh
-sudo apt install cmake make git clang liburcu-dev
+sudo apt install cmake make git clang liburcu-dev libkrb5-dev
 ```
 
 ## Examples

@@ -1,6 +1,6 @@
 [package]
 name = "libntirpc-sys"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 links = "ntirpc"
 authors = ["Ming Chen <v.mingchen@gmail.com>"]
@@ -17,3 +17,4 @@ bindgen = "0.72"
 
 [dev-dependencies]
 libc = "0.2"
+
