@@ -28,6 +28,10 @@ fn configure() {
     let mut cmd = Command::new("cmake");
     cmd.arg("-Wno-dev"); // supress developer warnings
     cmd.arg("-DUSE_LTTNG=Off");
+    // Disable the bundled prometheus monitoring stack: its global teardown
+    // corrupts the heap on exit (intermittent SIGABRT), and nothing in the
+    // NFS client uses it.
+    cmd.arg("-DUSE_MONITORING=Off");
     cmd.arg("-DCMAKE_BUILD_TYPE=RelWithDebInfo");
     cmd.arg(format!(
         "-DCMAKE_INSTALL_PREFIX={}",
@@ -76,7 +80,6 @@ fn main() {
         LIBNTIRPC_INSTALL_DIR.display()
     );
     println!("cargo:rustc-link-lib=dylib=ntirpc");
-    println!("cargo:rustc-link-lib=dylib=ntirpcmonitoring");
 
     // Expose the ntirpc include directory to dependent crates via the `links`
     // mechanism (DEP_NTIRPC_INCLUDE build-script env var).
