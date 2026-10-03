@@ -1,0 +1,162 @@
+
+add_definitions(
+  -DPORTMAP
+  -DINET6
+  -D_GNU_SOURCE
+)
+
+########### next target ###############
+
+SET(ntirpc_common_SRCS
+  auth_none.c
+  auth_unix.c
+  authunix_prot.c
+  bindresvport.c
+  bsd_epoll.c
+  city.c
+  clnt_bcast.c
+  clnt_dg.c
+  clnt_generic.c
+  clnt_perror.c
+  clnt_raw.c
+  clnt_simple.c
+  clnt_vc.c
+  getnetconfig.c
+  getnetpath.c
+  getpeereid.c
+  mt_misc.c
+  pmap_prot.c
+  pmap_prot2.c
+  pmap_rmt.c
+  rbtree.c
+  rbtree_x.c
+  rpc_prot.c
+  rpc_callmsg.c
+  rpc_commondata.c
+  rpc_crc32.c
+  rpc_dplx_msg.c
+  rpc_dtablesize.c
+  rpc_generic.c
+  rpcb_clnt.c
+  rpcb_prot.c
+  rpcb_st_xdr.c
+  strlcpy.c
+  svc.c
+  svc_auth.c
+  svc_auth_unix.c
+  svc_auth_none.c
+  svc_dg.c
+  svc_generic.c
+  svc_raw.c
+  svc_rqst.c
+  svc_simple.c
+  svc_vc.c
+  svc_xprt.c
+  xdr.c
+  xdr_float.c
+  xdr_mem.c
+  xdr_reference.c
+  xdr_ioq.c
+  svc_ioq.c
+  work_pool.c
+)
+
+if(USE_MONITORING)
+  SET(ntirpc_monitoring_SRCS
+    metrics_libntirpc.c
+  )
+endif(USE_MONITORING)
+
+if(USE_GSS)
+  SET(ntirpc_gss_SRCS
+    auth_gss.c authgss_hash.c
+    authgss_prot.c
+    svc_auth_gss.c
+    )
+
+  # fixme
+  # libntirpc_la_LDFLAGS += $(GSSGLUE_LIBS)
+  # libntirpc_la_CFLAGS = -DHAVE_RPCSEC_GSS $(GSSGLUE_CFLAGS)
+
+endif(USE_GSS)
+
+if(USE_RPC_RDMA)
+  SET(ntirpc_rdma_SRCS
+  clnt_rdma.c
+  rpc_rdma.c
+  svc_rdma.c
+  xdr_rdma.c
+  )
+endif(USE_RPC_RDMA)
+
+if(USE_GNUTLS)
+  SET(ntirpc_tls_SRCS
+    tls_gnutls.c
+    )
+endif(USE_GNUTLS)
+
+if(USE_OPENSSL)
+  SET(ntirpc_tls_SRCS
+    ${ntirpc_tls_SRC}
+    tls_openssl.c)
+endif(USE_OPENSSL)
+
+if(USE_TLS)
+  SET(ntirpc_tls_SRCS
+    ${ntirpc_tls_SRCS}
+    tls_transport.c
+    tls_init.c
+    svc_auth_tls.c
+    )
+endif(USE_TLS)
+
+
+if(USE_LTTNG_NTIRPC)
+  include("${CMAKE_CURRENT_BINARY_DIR}/../ntirpc_lttng_generation_file_properties.cmake")
+  add_subdirectory(lttng)
+endif(USE_LTTNG_NTIRPC)
+
+if (USE_MONITORING)
+  # Monitoring stack.
+  LIST(APPEND CMAKE_LIBRARY_PATH "${CMAKE_CURRENT_SOURCE_DIR}/monitoring/")
+  LINK_DIRECTORIES("${CMAKE_CURRENT_SOURCE_DIR}/monitoring/")
+  include_directories("${CMAKE_CURRENT_SOURCE_DIR}/monitoring/include")
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/monitoring/")
+endif (USE_MONITORING)
+
+# declares the library
+add_library(ntirpc STATIC
+  ${ntirpc_common_SRCS}
+  ${ntirpc_gss_SRCS}
+  ${ntirpc_rdma_SRCS}
+  ${ntirpc_tls_SRCS}
+  ${ntirpc_monitoring_SRCS}
+)
+
+# add required libraries--for Ganesha build, it's ok for them to
+# propagate (i.e., omit PRIVATE)
+target_link_libraries(ntirpc
+  ${SYSTEM_LIBRARIES}
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+if (USE_MONITORING)
+target_link_libraries(ntirpc ntirpcmonitoring)
+endif (USE_MONITORING)
+
+if(USE_LTTNG)
+target_link_libraries(ntirpc ntirpc_lttng)
+endif(USE_LTTNG)
+
+# set library version and symbol namespace(s) from gen'd map file
+set_target_properties(ntirpc PROPERTIES LINK_FLAGS
+	"-Wl,--version-script=${PROJECT_BINARY_DIR}/libntirpc.map"
+  VERSION ${NTIRPC_VERSION}
+  SOVERSION "${NTIRPC_MAJOR_VERSION}${NTIRPC_MINOR_VERSION}"
+  )
+
+install(TARGETS ntirpc DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+########### install files ###############
+
+# We are still missing the install of docs and stuff

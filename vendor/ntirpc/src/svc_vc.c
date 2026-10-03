@@ -1,0 +1,1645 @@
+/*
+ * Copyright (c) 2009, Sun Microsystems, Inc.
+ * Copyright (c) 2012-2018 Red Hat, Inc. and/or its affiliates.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ * - Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ * - Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ * - Neither the name of Sun Microsystems, Inc. nor the names of its
+ *   contributors may be used to endorse or promote products derived
+ *   from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "config.h"
+
+/*
+ * svc_vc.c, Server side for Connection Oriented RPC.
+ *
+ * Actually implements two flavors of transporter -
+ * a tcp rendezvouser (a listner and connection establisher)
+ * and a record/tcp stream.
+ */
+#include <sys/cdefs.h>
+#include <sys/socket.h>
+#ifdef RPC_VSOCK
+#include <linux/vm_sockets.h>
+#endif /* VSOCK */
+#include <sys/types.h>
+#include <sys/param.h>
+#include <sys/poll.h>
+
+#include <sys/un.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+#include <assert.h>
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <getpeereid.h>
+
+#include <rpc/types.h>
+#include <misc/city.h>
+#include <misc/portable.h>
+#include <misc/timespec.h>
+#include <rpc/clnt.h>
+#include <rpc/rpc.h>
+#include <rpc/svc.h>
+#include "rpc/haproxy.h"
+#include <rpc/svc_auth.h>
+#include <rpc/svc_rqst.h>
+#include <rpc/xdr_ioq.h>
+#include <arpa/inet.h>
+
+#include "rpc_com.h"
+#include "clnt_internal.h"
+#include "svc_internal.h"
+#include "svc_xprt.h"
+#include "rpc_dplx_internal.h"
+#include "svc_ioq.h"
+#include "tls.h"
+
+static void svc_vc_rendezvous_ops(SVCXPRT *);
+static void svc_vc_override_ops(SVCXPRT *, SVCXPRT *);
+
+/*
+ * A record is composed of one or more record fragments.
+ * A record fragment is a four-byte header followed by zero to
+ * 2**32-1 bytes.  The header is treated as a long unsigned and is
+ * encode/decoded to the network via htonl/ntohl.  The low order 31 bits
+ * are a byte count of the fragment.  The highest order bit is a boolean:
+ * 1 => this fragment is the last fragment of the record,
+ * 0 => this fragment is followed by more fragment(s).
+ *
+ * The fragment/record machinery is not general;  it is constructed to
+ * meet the needs of xdr and rpc based on tcp.
+ */
+
+#define LAST_FRAG ((u_int32_t)(1 << 31))
+
+/*
+ * Usage:
+ * xprt = svc_vc_ncreate(sock, send_buf_size, recv_buf_size);
+ *
+ * Creates, registers, and returns a (rpc) tcp based transport.
+ * If a problem occurred, this routine returns a NULL.
+ *
+ * Since streams do buffered io similar to stdio, the caller can specify
+ * how big the send and receive buffers are via the second and third parms;
+ * 0 => use the system default.
+ *
+ * Added svc_vc_ncreatef with flags argument, has the behavior of the
+ * original function with flags SVC_CREATE_FLAG_CLOSE.
+ *
+ */
+static void
+svc_vc_xprt_free(struct svc_vc_xprt *xd)
+{
+	XDR_DESTROY(xd->sx_dr.ioq.xdrs);
+	rpc_dplx_rec_destroy(&xd->sx_dr);
+	mem_free(xd, sizeof(struct svc_vc_xprt));
+}
+
+static struct svc_vc_xprt *
+svc_vc_xprt_zalloc(void)
+{
+	struct svc_vc_xprt *xd = mem_zalloc(sizeof(struct svc_vc_xprt));
+
+	/* Init SVCXPRT locks, etc */
+	rpc_dplx_rec_init(&xd->sx_dr);
+	xdr_ioq_setup(&xd->sx_dr.ioq);
+	return (xd);
+}
+
+void
+svc_vc_xprt_setup(SVCXPRT **sxpp)
+{
+	if (unlikely(*sxpp)) {
+		svc_vc_xprt_free(VC_DR(REC_XPRT(*sxpp)));
+		*sxpp = NULL;
+	} else {
+		struct svc_vc_xprt *xd = svc_vc_xprt_zalloc();
+
+		*sxpp = &xd->sx_dr.xprt;
+	}
+}
+
+SVCXPRT *
+svc_vc_ncreatef(const int fd, const u_int sendsz, const u_int recvsz,
+		const uint32_t flags)
+{
+	struct __rpc_sockinfo si;
+	SVCXPRT *xprt;
+	struct rpc_dplx_rec *rec;
+	struct svc_vc_xprt *xd;
+	const char *netid;
+	u_int recvsize;
+	u_int sendsize;
+	u_int xp_flags;
+	int rc;
+
+	/* atomically find or create shared fd state; ref+1; locked */
+	xprt = svc_xprt_lookup(fd, svc_vc_xprt_setup);
+	if (!xprt) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d svc_xprt_lookup failed",
+			__func__, fd);
+		return (NULL);
+	}
+	rec = REC_XPRT(xprt);
+
+	xp_flags = atomic_postset_uint16_t_bits(&xprt->xp_flags,
+						(flags & SVC_XPRT_FLAG_CLOSE)
+						| SVC_XPRT_FLAG_INITIALIZED);
+	if (xp_flags & SVC_XPRT_FLAG_INITIALIZED) {
+		rpc_dplx_rui(rec);
+		XPRT_TRACE(xprt, __func__, __func__, __LINE__);
+		return (xprt);
+	}
+
+	if (!__rpc_fd2sockinfo(fd, &si)) {
+		atomic_clear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_INITIALIZED);
+		rpc_dplx_rui(rec);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d could not get transport information",
+			__func__, fd);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
+	if (!__rpc_sockinfo2netid(&si, &netid)) {
+		atomic_clear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_INITIALIZED);
+		rpc_dplx_rui(rec);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d could not get network information",
+			__func__, fd);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
+	/*
+	 * Find the receive and the send size
+	 */
+	sendsize = __rpc_get_t_size(si.si_af, si.si_proto, (int)sendsz);
+	recvsize = __rpc_get_t_size(si.si_af, si.si_proto, (int)recvsz);
+	/*
+	 * Should be multiple of 4 for XDR.
+	 */
+	xd = VC_DR(rec);
+	xd->sx_dr.sendsz = ((sendsize + 3) / 4) * 4;
+	xd->sx_dr.recvsz = ((recvsize + 3) / 4) * 4;
+	xd->sx_dr.pagesz = sysconf(_SC_PAGESIZE);
+	xd->sx_dr.maxrec = __svc_maxrec;
+
+	/* duplex streams are not used by the rendezvous transport */
+	xdrmem_create(xd->sx_dr.ioq.xdrs, NULL, 0, XDR_ENCODE);
+
+	svc_vc_rendezvous_ops(xprt);
+#ifdef RPC_VSOCK
+	if (si.si_af == AF_VSOCK)
+		 xprt->xp_type = XPRT_VSOCK_RENDEZVOUS;
+#endif /* VSOCK */
+
+	/* caller should know what it's doing */
+	if (flags & SVC_CREATE_FLAG_LISTEN) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d listen",
+			 __func__, fd);
+		listen(fd, SOMAXCONN);
+	}
+
+	__rpc_address_setup(&xprt->xp_local);
+	rc = getsockname(fd, xprt->xp_local.nb.buf, &xprt->xp_local.nb.len);
+	if (rc < 0) {
+		atomic_clear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_INITIALIZED);
+		rpc_dplx_rui(rec);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d getsockname failed (%d)",
+			 __func__, fd, rc);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
+	xprt->xp_netid = mem_strdup(netid);
+
+	/* Conditional register */
+	if ((!(__svc_params->flags & SVC_FLAG_NOREG_XPRTS)
+	     && !(flags & SVC_CREATE_FLAG_XPRT_NOREG))
+	    || (flags & SVC_CREATE_FLAG_XPRT_DOREG))
+		svc_rqst_evchan_reg(__svc_params->ev_u.evchan.id, xprt,
+				    RPC_DPLX_LOCKED |
+				    SVC_RQST_FLAG_CHAN_AFFINITY);
+
+	atomic_set_uint16_t_bits(&xprt->xp_flags,
+	    SVC_XPRT_FLAG_READY);
+
+	/* release */
+	rpc_dplx_rui(rec);
+	XPRT_TRACE(xprt, __func__, __func__, __LINE__);
+
+#if defined(HAVE_BLKIN)
+	__rpc_set_blkin_endpoint(xprt, "svc_vc");
+#endif
+
+	return (xprt);
+}
+
+static SVCXPRT *
+makefd_xprt(const int fd, const u_int sendsz, const u_int recvsz,
+	    struct __rpc_sockinfo *si, u_int flags)
+{
+	SVCXPRT *xprt;
+	struct svc_vc_xprt *xd;
+	struct rpc_dplx_rec *rec;
+	const char *netid;
+	u_int recvsize;
+	u_int sendsize;
+	u_int xp_flags;
+
+	assert(fd != -1);
+
+	/* atomically find or create shared fd state; ref+1; locked */
+	if (flags & SVC_XPRT_FLAG_LOOKUP_ONLY) {
+		xprt = svc_xprt_lookup(fd, NULL);
+		/* Do not associate SVC_XPRT_FLAG_LOOKUP_ONLY with xprt, as
+		 * this flag does not represent the xprt state. It is only a
+		 * flag required for the xprt creation.
+		 */
+		flags = flags & (~SVC_XPRT_FLAG_LOOKUP_ONLY);
+	} else {
+		xprt = svc_xprt_lookup(fd, svc_vc_xprt_setup);
+	}
+
+	if (!xprt) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d svc_xprt_lookup failed",
+			__func__, fd);
+		return (NULL);
+	}
+
+	rec = REC_XPRT(xprt);
+
+	xp_flags = atomic_postset_uint16_t_bits(&xprt->xp_flags, flags
+						| SVC_XPRT_FLAG_INITIALIZED);
+	if (xp_flags & SVC_XPRT_FLAG_INITIALIZED) {
+		rpc_dplx_rui(rec);
+		XPRT_TRACE(xprt, __func__, __func__, __LINE__);
+		return (xprt);
+	}
+
+	if (!__rpc_fd2sockinfo(fd, si)) {
+		atomic_clear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_INITIALIZED);
+		rpc_dplx_rui(rec);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d could not get transport information",
+			__func__, fd);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
+	if (!__rpc_sockinfo2netid(si, &netid)) {
+		atomic_clear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_INITIALIZED);
+		rpc_dplx_rui(rec);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d could not get network information",
+			__func__, fd);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
+	/*
+	 * Find the receive and the send size
+	 */
+	sendsize = __rpc_get_t_size(si->si_af, si->si_proto, (int)sendsz);
+	recvsize = __rpc_get_t_size(si->si_af, si->si_proto, (int)recvsz);
+	/*
+	 * Should be multiple of 4 for XDR.
+	 */
+	xd = VC_DR(rec);
+	xd->sx_dr.sendsz = ((sendsize + 3) / 4) * 4;
+	xd->sx_dr.recvsz = ((recvsize + 3) / 4) * 4;
+	xd->sx_dr.pagesz = sysconf(_SC_PAGESIZE);
+	xd->sx_dr.maxrec = __svc_maxrec;
+
+#ifdef RPC_VSOCK
+	if (si->si_af == AF_VSOCK)
+		 xprt->xp_type = XPRT_VSOCK;
+#endif /* VSOCK */
+
+	xprt->xp_netid = mem_strdup(netid);
+
+	/* release */
+	rpc_dplx_rui(rec);
+	XPRT_TRACE(xprt, __func__, __func__, __LINE__);
+
+	return (xprt);
+}
+
+/*
+ * Like sv_fd_ncreate(), except export flags for additional control.
+ */
+SVCXPRT *
+svc_fd_ncreatef(const int fd, const u_int sendsize, const u_int recvsize,
+		const uint32_t flags)
+{
+	SVCXPRT *xprt;
+	struct __rpc_sockinfo si;
+	int rc;
+
+	assert(fd != -1);
+
+	xprt = makefd_xprt(fd, sendsize, recvsize, &si,
+			   (flags & SVC_XPRT_FLAG_CLOSE) |
+			   (flags & SVC_XPRT_FLAG_LOOKUP_ONLY));
+
+	if ((!xprt) || (!(xprt->xp_flags & SVC_XPRT_FLAG_INITIAL)))
+		return (xprt);
+
+	svc_vc_override_ops(xprt, NULL);
+
+	__rpc_address_setup(&xprt->xp_local);
+	rc = getsockname(fd, xprt->xp_local.nb.buf, &xprt->xp_local.nb.len);
+	if (rc < 0) {
+		xprt->xp_local.nb.len = sizeof(struct sockaddr_storage);
+		memset(xprt->xp_local.nb.buf, 0xfe, xprt->xp_local.nb.len);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d getsockname failed (%d)",
+			 __func__, fd, rc);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
+	__rpc_address_setup(&xprt->xp_remote);
+	rc = getpeername(fd, xprt->xp_remote.nb.buf, &xprt->xp_remote.nb.len);
+	if (rc < 0) {
+		xprt->xp_remote.nb.len = sizeof(struct sockaddr_storage);
+		memset(xprt->xp_remote.nb.buf, 0xfe, xprt->xp_remote.nb.len);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: fd %d getpeername failed (%d)",
+			 __func__, fd, rc);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+	XPRT_TRACE(xprt, __func__, __func__, __LINE__);
+
+	/* Conditional register */
+	if ((!(__svc_params->flags & SVC_FLAG_NOREG_XPRTS)
+	     && !(flags & SVC_CREATE_FLAG_XPRT_NOREG))
+	    || (flags & SVC_CREATE_FLAG_XPRT_DOREG))
+		svc_rqst_evchan_reg(__svc_params->ev_u.evchan.id, xprt,
+				    SVC_RQST_FLAG_CHAN_AFFINITY);
+
+#if defined(HAVE_BLKIN)
+	__rpc_set_blkin_endpoint(xprt, "svc_vc");
+#endif
+
+	return (xprt);
+}
+
+ /*ARGSUSED*/
+static enum xprt_stat
+svc_vc_rendezvous(SVCXPRT *xprt)
+{
+	struct svc_vc_xprt *req_xd = VC_DR(REC_XPRT(xprt));
+	SVCXPRT *newxprt;
+	struct svc_vc_xprt *xd;
+	struct sockaddr_storage addr;
+	struct __rpc_sockinfo si;
+	int fd;
+	int rc;
+	socklen_t len;
+	static int n = 1;
+	struct timeval timeval;
+	struct sockaddr *sa;
+
+	XPRT_AUTO_TRACEPOINT(xprt, rendezvous_start, TRACE_INFO,
+		"rendezvous_start");
+
+ again:
+	len = sizeof(addr);
+	fd = accept(xprt->xp_fd, (struct sockaddr *)(void *)&addr, &len);
+	if (fd < 0) {
+		if (errno == EINTR)
+			goto again;
+		/*
+		 * Clean out the most idle file descriptor when we're
+		 * running out.
+		 */
+		if (errno == EMFILE || errno == ENFILE) {
+			switch (__svc_params->ev_type) {
+#if defined(TIRPC_EPOLL)
+			case SVC_EVENT_EPOLL:
+				break;
+#endif
+			default:
+				abort();	/* XXX */
+				break;
+			}	/* switch */
+			goto again;
+		}
+		return (XPRT_DIED);
+	}
+	if (unlikely(svc_rqst_rearm_events(xprt, SVC_XPRT_FLAG_ADDED_RECV))) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
+			__func__, xprt, xprt->xp_fd);
+		close(fd);
+		return (XPRT_DIED);
+	}
+
+	(void) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &n, sizeof(n));
+
+	/*
+	 * make a new transport (re-uses xprt)
+	 */
+	newxprt = makefd_xprt(fd, req_xd->sx_dr.sendsz, req_xd->sx_dr.recvsz,
+			      &si, SVC_XPRT_FLAG_CLOSE);
+	if (unlikely(!newxprt)) {
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: listen fd %d of %p failed for %d, close fd",
+			__func__, xprt->xp_fd, xprt, fd);
+		close(fd);
+		return (XPRT_DIED);
+	}
+	if (unlikely(!(newxprt->xp_flags & SVC_XPRT_FLAG_INITIAL))) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d with xp_refcnt %" PRId32 ", failed (will set dead)",
+			__func__, newxprt, newxprt->xp_fd, newxprt->xp_refcnt);
+		SVC_DESTROY(newxprt);
+		/* Was never added to epoll */
+		SVC_RELEASE(newxprt, SVC_RELEASE_FLAG_NONE);
+		return (XPRT_DIED);
+	}
+
+	svc_vc_override_ops(newxprt, xprt);
+
+	__rpc_address_setup(&newxprt->xp_remote);
+	memcpy(newxprt->xp_remote.nb.buf, &addr, len);
+	newxprt->xp_remote.nb.len = len;
+	XPRT_TRACE(newxprt, __func__, __func__, __LINE__);
+
+	sa = (struct sockaddr *)newxprt->xp_remote.nb.buf;
+	/* Store client information (IP & Port) in SVCXPRT */
+	if (newxprt->xp_remote.nb.len > 0 && sa != NULL) {
+		if (sa->sa_family == AF_INET) {
+			struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+			inet_ntop(AF_INET, &sin->sin_addr, newxprt->xp_clnt_addr,
+					sizeof(newxprt->xp_clnt_addr));
+			newxprt->xp_clnt_port = ntohs(sin->sin_port);
+		} else if (sa->sa_family == AF_INET6) {
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+			inet_ntop(AF_INET6, &sin6->sin6_addr, newxprt->xp_clnt_addr,
+					sizeof(newxprt->xp_clnt_addr));
+			newxprt->xp_clnt_port = ntohs(sin6->sin6_port);
+		} else {
+			snprintf(newxprt->xp_clnt_addr, sizeof(newxprt->xp_clnt_addr), "unknown");
+			newxprt->xp_clnt_port = 0;
+		}
+	} else {
+		snprintf(newxprt->xp_clnt_addr, sizeof(newxprt->xp_clnt_addr), "no_addr");
+		newxprt->xp_clnt_port = 0;
+	}
+
+	/* XXX fvdl - is this useful? (Yes.  Matt) */
+	if (si.si_proto == IPPROTO_TCP) {
+		len = 1;
+		(void) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &len,
+				  sizeof(len));
+	}
+
+	/* set SO_SNDTIMEO to deal with bad clients */
+	timeval.tv_sec = 5;
+	timeval.tv_usec = 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeval,
+		       sizeof(timeval))) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d SO_SNDTIMEO failed (%d)",
+			 __func__, fd, errno);
+	}
+
+	__rpc_address_setup(&newxprt->xp_local);
+	rc = getsockname(fd, newxprt->xp_local.nb.buf,
+			 &newxprt->xp_local.nb.len);
+	if (rc < 0) {
+		newxprt->xp_local.nb.len = sizeof(struct sockaddr_storage);
+		memset(newxprt->xp_local.nb.buf, 0xfe,
+		       newxprt->xp_local.nb.len);
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d getsockname failed (%d)",
+			 __func__, fd, rc);
+	}
+
+#if defined(HAVE_BLKIN)
+	__rpc_set_blkin_endpoint(newxprt, "svc_vc");
+#endif
+
+	xd = VC_DR(REC_XPRT(newxprt));
+	xd->sx_dr.sendsz = req_xd->sx_dr.sendsz;
+	xd->sx_dr.recvsz = req_xd->sx_dr.recvsz;
+	xd->sx_dr.pagesz = req_xd->sx_dr.pagesz;
+	xd->sx_dr.maxrec = req_xd->sx_dr.maxrec;
+
+	SVC_REF(xprt, SVC_REF_FLAG_NONE);
+	newxprt->xp_parent = xprt;
+	if (xprt->xp_dispatch.rendezvous_cb(newxprt)
+	 || svc_rqst_xprt_register(newxprt, xprt)) {
+		// Note xp_parent is released in svc_vc_destroy_task
+		SVC_DESTROY(newxprt);
+		/* Was never added to epoll */
+		SVC_RELEASE(newxprt, SVC_RELEASE_FLAG_NONE);
+		return (XPRT_DESTROYED);
+	}
+
+	atomic_set_uint16_t_bits(&newxprt->xp_flags,
+	    SVC_XPRT_FLAG_READY);
+
+	__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+		"New client connected "
+		"xprt %p, fd %d, port %d",
+		newxprt, newxprt->xp_fd,
+		svc_get_port(newxprt->xp_local.nb.buf));
+
+	/* We're not using a ref for the hook anymore, since epoll doesn't store
+	 * the transport pointer.  Drop the extra ref here. */
+	SVC_RELEASE(newxprt, SVC_RELEASE_FLAG_NONE);
+	return (XPRT_IDLE);
+}
+
+// This can be overridden in tests.
+__attribute__((weak)) void svc_vc_notify_xprt_destroy_for_testing(
+	const struct sockaddr_storage *remote_address)
+{
+}
+
+static void
+svc_vc_destroy_task(struct work_pool_entry *wpe)
+{
+	struct rpc_dplx_rec *rec =
+			opr_containerof(wpe, struct rpc_dplx_rec, ioq.ioq_wpe);
+	uint16_t xp_flags;
+	bool close_fd = false;
+
+	const int32_t xp_refcnt = atomic_fetch_int32_t(&rec->xprt.xp_refcnt);
+	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+		"%s() %p fd %d xp_refcnt %" PRId32,
+		__func__, rec, rec->xprt.xp_fd, xp_refcnt);
+
+	if (xp_refcnt > 0) {
+		/* instead of nanosleep */
+		work_pool_submit(&svc_work_pool, &(rec->ioq.ioq_wpe));
+		return;
+	} else if (unlikely(xp_refcnt < 0)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s() negative refcnt: %p fd %d xp_refcnt %" PRId32,
+			__func__, rec, rec->xprt.xp_fd, xp_refcnt);
+		abort();
+	}
+
+	xp_flags = atomic_postclear_uint16_t_bits(&rec->xprt.xp_flags,
+						  SVC_XPRT_FLAG_CLOSE);
+	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+		"%s() xprt: %p fd %d xp_refcnt %" PRId32 ", DESTROYING=%d RELEASING=%d",
+		__func__, &rec->xprt, rec->xprt.xp_fd, xp_refcnt,
+		((xp_flags & SVC_XPRT_FLAG_DESTROYING) !=  0),
+		((xp_flags & SVC_XPRT_FLAG_RELEASING) != 0));
+	close_fd = ((xp_flags & SVC_XPRT_FLAG_CLOSE) &&
+		rec->xprt.xp_fd != RPC_ANYFD);
+	if (close_fd) {
+#ifdef USE_TLS
+		/*   need to tell the client about TLS Connection closure */
+		SVCXPRT *xprt = &rec->xprt;
+
+		svc_tls_close(xprt);
+#endif
+		/* Shutting down without releasing the fd, since
+		 * xp_free_user_data() might be using it */
+		(void)shutdown(rec->xprt.xp_fd, SHUT_RDWR);
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d shutdown",
+			 __func__, rec->xprt.xp_fd);
+		if (rec->xprt.xp_fd_send != RPC_ANYFD)
+			(void)shutdown(rec->xprt.xp_fd_send, SHUT_RDWR);
+	} else {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: called for xprt %p, no close_fd, fd %d flags %x",
+			 __func__, &rec->xprt, rec->xprt.xp_fd, xp_flags);
+	}
+
+	if (rec->xprt.xp_ops->xp_free_user_data)
+		rec->xprt.xp_ops->xp_free_user_data(&rec->xprt);
+
+	/* Close and reset xprt's FD after the xp_free_user_data call.
+	 * It's safe to release the FD at this point (by calling close), since
+	 * there are no references left to this XPRT. */
+	if (close_fd) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: fd %d xprt %p: fd close",
+			__func__, rec->xprt.xp_fd, &rec->xprt);
+		if (rec->xprt.xp_refcnt > 0) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: fd %d before close has ref_count %" PRId32,
+				 __func__, rec->xprt.xp_fd, rec->xprt.xp_refcnt);
+			assert(false);
+		}
+		(void)close(rec->xprt.xp_fd);
+		rec->xprt.xp_fd = RPC_ANYFD;
+		if (rec->xprt.xp_fd_send != RPC_ANYFD) {
+			(void)close(rec->xprt.xp_fd_send);
+			rec->xprt.xp_fd_send = RPC_ANYFD;
+		}
+	}
+
+	if (rec->xprt.xp_tp)
+		mem_free(rec->xprt.xp_tp, 0);
+	if (rec->xprt.xp_netid)
+		mem_free(rec->xprt.xp_netid, 0);
+
+	if (rec->xprt.xp_parent)
+		SVC_RELEASE(rec->xprt.xp_parent, SVC_RELEASE_FLAG_NONE);
+
+	const struct sockaddr_storage remote_address = rec->xprt.xp_remote.ss;
+	svc_vc_xprt_free(VC_DR(rec));
+	svc_vc_notify_xprt_destroy_for_testing(&remote_address);
+}
+
+static void
+svc_vc_unlink_it(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
+{
+	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+		"%s() %p fd %d xp_refcnt %" PRId32 " @%s:%d",
+		__func__, xprt, xprt->xp_fd, xprt->xp_refcnt, tag, line);
+	svc_rqst_xprt_unregister(xprt, flags);
+}
+
+static void
+svc_vc_destroy_it(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
+{
+	struct timespec ts = {
+		.tv_sec = 0,
+		.tv_nsec = 0,
+	};
+
+	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+		"%s() %p fd %d xp_refcnt %" PRId32 " @%s:%d",
+		__func__, xprt, xprt->xp_fd, xprt->xp_refcnt, tag, line);
+
+	while (atomic_postset_uint16_t_bits(&(REC_XPRT(xprt)->ioq.ioq_s.qflags),
+					    IOQ_FLAG_WORKING)
+	       & IOQ_FLAG_WORKING) {
+		nanosleep(&ts, NULL);
+	}
+
+	REC_XPRT(xprt)->ioq.ioq_wpe.fun = svc_vc_destroy_task;
+	work_pool_submit(&svc_work_pool, &(REC_XPRT(xprt)->ioq.ioq_wpe));
+}
+
+extern mutex_t ops_lock;
+
+ /*ARGSUSED*/
+static bool
+svc_vc_control(SVCXPRT *xprt, const u_int rq, void *in)
+{
+	switch (rq) {
+	case SVCGET_XP_FLAGS:
+		*(u_int *) in = xprt->xp_flags;
+		break;
+	case SVCSET_XP_FLAGS:
+		xprt->xp_flags = *(u_int *) in;
+		break;
+	case SVCGET_XP_UNREF_USER_DATA:
+		mutex_lock(&ops_lock);
+		*(svc_xprt_void_fun_t *) in = xprt->xp_ops->xp_unref_user_data;
+		mutex_unlock(&ops_lock);
+		break;
+	case SVCSET_XP_UNREF_USER_DATA:
+		mutex_lock(&ops_lock);
+		xprt->xp_ops->xp_unref_user_data = *(svc_xprt_void_fun_t) in;
+		mutex_unlock(&ops_lock);
+		break;
+	case SVCGET_XP_FREE_USER_DATA:
+		mutex_lock(&ops_lock);
+		*(svc_xprt_fun_t *) in = xprt->xp_ops->xp_free_user_data;
+		mutex_unlock(&ops_lock);
+		break;
+	case SVCSET_XP_FREE_USER_DATA:
+		mutex_lock(&ops_lock);
+		xprt->xp_ops->xp_free_user_data = *(svc_xprt_fun_t) in;
+		mutex_unlock(&ops_lock);
+		break;
+	default:
+		return (FALSE);
+	}
+	return (TRUE);
+}
+
+static bool
+svc_vc_rendezvous_control(SVCXPRT *xprt, const u_int rq, void *in)
+{
+	struct svc_vc_xprt *xd = VC_DR(REC_XPRT(xprt));
+
+	switch (rq) {
+	case SVCGET_CONNMAXREC:
+		*(int *)in = xd->sx_dr.maxrec;
+		break;
+	case SVCSET_CONNMAXREC:
+		xd->sx_dr.maxrec = *(int *)in;
+		break;
+	case SVCGET_XP_UNREF_USER_DATA:
+		mutex_lock(&ops_lock);
+		*(svc_xprt_void_fun_t *) in = xprt->xp_ops->xp_unref_user_data;
+		mutex_unlock(&ops_lock);
+		break;
+	case SVCSET_XP_UNREF_USER_DATA:
+		mutex_lock(&ops_lock);
+		xprt->xp_ops->xp_unref_user_data = *(svc_xprt_void_fun_t) in;
+		mutex_unlock(&ops_lock);
+		break;
+	case SVCGET_XP_FREE_USER_DATA:
+		mutex_lock(&ops_lock);
+		*(svc_xprt_fun_t *) in = xprt->xp_ops->xp_free_user_data;
+		mutex_unlock(&ops_lock);
+		break;
+	case SVCSET_XP_FREE_USER_DATA:
+		mutex_lock(&ops_lock);
+		xprt->xp_ops->xp_free_user_data = *(svc_xprt_fun_t) in;
+		mutex_unlock(&ops_lock);
+		break;
+	default:
+		return (FALSE);
+	}
+	return (TRUE);
+}
+
+static enum xprt_stat
+svc_vc_stat(SVCXPRT *xprt)
+{
+	if (xprt->xp_flags & SVC_XPRT_FLAG_DESTROYED)
+		return (XPRT_DESTROYED);
+
+	return (XPRT_IDLE);
+}
+
+static bool is_remote_addr_set(SVCXPRT *xprt)
+{
+	return (xprt->xp_flags & SVC_XPRT_FLAG_REMOTE_ADDR_SET);
+}
+
+static bool update_and_notify_remote_address_set(SVCXPRT *xprt)
+{
+	u_int prev_xp_flags;
+	__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: %p fd %d update remote address set",
+			__func__, xprt, xprt->xp_fd);
+	prev_xp_flags = atomic_postset_uint16_t_bits(&xprt->xp_flags,
+			SVC_XPRT_FLAG_REMOTE_ADDR_SET);
+	/* remote addr set was must be called only once for xprt */
+	assert(!(prev_xp_flags & SVC_XPRT_FLAG_REMOTE_ADDR_SET));
+	if (xprt->xp_dispatch.remote_addr_set_cb) {
+		if (xprt->xp_dispatch.remote_addr_set_cb(xprt)) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d remote_addr_set cb failed"
+				" (will set dead)",
+				__func__, xprt, xprt->xp_fd);
+			return false;
+		}
+	}
+	return true;
+}
+
+enum haproxy_ret_code {
+       HAPROXY_RET_CODE__SUCCESS = 0,
+       HAPROXY_RET_CODE__FAILURE,
+       HAPROXY_RET_CODE__IGNORE_LOCAL,
+       HAPROXY_RET_CODE__NOT_HAPROXY
+};
+
+static enum haproxy_ret_code
+safe_read_and_update(SVCXPRT *xprt, ssize_t length_to_read,
+		     ssize_t *remaining_length_to_read, void *value)
+{
+	ssize_t rlen;
+	if (unlikely(*remaining_length_to_read < length_to_read)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d proxy header failed header remaining_length_to_read(%d) < length_to_read(%d) "
+			"(will set dead)",
+			__func__, xprt, xprt->xp_fd, *remaining_length_to_read,
+			length_to_read);
+		return HAPROXY_RET_CODE__FAILURE;
+	}
+	rlen = recv(xprt->xp_fd, value, length_to_read, MSG_WAITALL);
+	if (unlikely(rlen != length_to_read)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d proxy header failed header rlen = %zd "
+			"(will set dead)",
+			__func__, xprt, xprt->xp_fd, rlen);
+		return HAPROXY_RET_CODE__FAILURE;
+	}
+	*remaining_length_to_read -= length_to_read;
+
+	return HAPROXY_RET_CODE__SUCCESS;
+}
+
+/*
+ * Reads and discards length_to_ignore bytes from socket
+ */
+static enum haproxy_ret_code
+ignore_remaining_proxy_protocol(SVCXPRT *xprt, ssize_t length_to_ignore)
+{
+	enum haproxy_ret_code retval;
+	ssize_t remaining_header_to_read = length_to_ignore;
+#define TEMP_BUFFER_SIZE 200
+	char temp_buffer[TEMP_BUFFER_SIZE];
+	while (remaining_header_to_read > 0) {
+		const uint16_t bytes_to_read =
+			MIN(remaining_header_to_read, TEMP_BUFFER_SIZE);
+		retval = safe_read_and_update(xprt, bytes_to_read,
+					      &remaining_header_to_read,
+					      temp_buffer);
+		if (retval != HAPROXY_RET_CODE__SUCCESS) {
+			return retval;
+		}
+	}
+	return HAPROXY_RET_CODE__SUCCESS;
+}
+
+#ifdef PROXY_PROTOCOL_PARSE_COMMON_NETWORK_ID
+static enum haproxy_ret_code handle_proxy_protocol_network_id(
+	SVCXPRT *xprt, const struct proxy_protocol_tlv_header *tlv)
+{
+	switch (tlv->type) {
+	case PP2_TYPE_GCP:
+		if (tlv->length != PP2_TYPE_GCP_EXPECTED_LENGTH) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d proxy header failed to parse PP2_TYPE_GCP. TLV length mismatch - got %d, expected %d"
+				"(will set dead)",
+				__func__, xprt, xprt->xp_fd, tlv->length,
+				PP2_TYPE_GCP_EXPECTED_LENGTH);
+			return HAPROXY_RET_CODE__FAILURE;
+		}
+		xprt->xp_remote_network_id.source = PP2_TYPE_GCP;
+		xprt->xp_remote_network_id.gcp_psc_connection_id =
+			be64toh(*(uint64_t *)tlv->value);
+		XPRT_AUTO_TRACEPOINT(xprt, parse_network_id_gcp, TRACE_DEBUG,
+				     "parsed network id from PP2_TYPE_GCP");
+		break;
+	case PP2_TYPE_AWS:
+		// fallthrough
+	case PP2_TYPE_AZURE:
+		// fallthrough
+	default:
+		XPRT_AUTO_TRACEPOINT(
+			xprt, parse_network_id_ignored, TRACE_DEBUG,
+			"not parsing network id for unsupported TLV type: {}",
+			tlv->type);
+		break;
+	}
+
+	return HAPROXY_RET_CODE__SUCCESS;
+}
+#endif /* PROXY_PROTOCOL_PARSE_COMMON_NETWORK_ID */
+
+static enum haproxy_ret_code handle_haproxy_tlv(SVCXPRT *xprt,
+						ssize_t length_to_read)
+{
+	enum haproxy_ret_code retval;
+	ssize_t remaining_length_to_read = length_to_read;
+	proxy_protocol_tlv_type type;
+	proxy_protocol_tlv_length length;
+	void *value;
+	struct proxy_protocol_tlv_headers *const tlv_headers =
+		&xprt->proxy_protocol_tlv_headers;
+
+	while (remaining_length_to_read > 0) {
+		retval = safe_read_and_update(xprt,
+					      sizeof(proxy_protocol_tlv_type),
+					      &remaining_length_to_read, &type);
+		if (retval != HAPROXY_RET_CODE__SUCCESS) {
+			return retval;
+		}
+
+		retval = safe_read_and_update(xprt,
+					      sizeof(proxy_protocol_tlv_length),
+					      &remaining_length_to_read,
+					      &length);
+		if (retval != HAPROXY_RET_CODE__SUCCESS) {
+			return retval;
+		}
+		length = ntohs(length);
+
+		value = malloc(length);
+		if (!value) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d proxy header failed header failed to malloc tlv data"
+				"(will set dead)",
+				__func__, xprt, xprt->xp_fd);
+			return HAPROXY_RET_CODE__FAILURE;
+		}
+		retval = safe_read_and_update(xprt, length,
+					      &remaining_length_to_read, value);
+		if (retval != HAPROXY_RET_CODE__SUCCESS) {
+			free(value);
+			return retval;
+		}
+
+		const size_t new_size =
+			sizeof(struct proxy_protocol_tlv_header) *
+			(tlv_headers->tlv_count + 1);
+		struct proxy_protocol_tlv_header *new_tlvs =
+			realloc(tlv_headers->tlvs, new_size);
+		if (!new_tlvs) {
+			free(value);
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d proxy header failed header failed to realloc tlvs"
+				"(will set dead)",
+				__func__, xprt, xprt->xp_fd);
+			return HAPROXY_RET_CODE__FAILURE;
+		}
+		tlv_headers->tlvs = new_tlvs;
+		struct proxy_protocol_tlv_header *current_tlv =
+			&tlv_headers->tlvs[tlv_headers->tlv_count];
+		current_tlv->type = type;
+		current_tlv->length = length;
+		current_tlv->value = value;
+		tlv_headers->tlv_count++;
+
+#ifdef PROXY_PROTOCOL_PARSE_COMMON_NETWORK_ID
+		const enum haproxy_ret_code parse_network_id_retval =
+			handle_proxy_protocol_network_id(xprt, current_tlv);
+		if (parse_network_id_retval != HAPROXY_RET_CODE__SUCCESS) {
+			return parse_network_id_retval;
+		}
+#endif /* PROXY_PROTOCOL_PARSE_COMMON_NETWORK_ID */
+	}
+
+	assert(remaining_length_to_read == 0);
+
+	return HAPROXY_RET_CODE__SUCCESS;
+}
+
+static enum haproxy_ret_code handle_haproxy_header_local_cmd(
+	SVCXPRT *xprt, struct proxy_header_part *proxy_header_part)
+{
+	enum haproxy_ret_code ret;
+	__warnx(TIRPC_DEBUG_FLAG_RPC_RDMA,
+		"%s: %p fd %d proxy ignored for local. len ignored: %d",
+		__func__, xprt, xprt->xp_fd, proxy_header_part->len);
+	const enum haproxy_ret_code ignore_remaining_data_result =
+		ignore_remaining_proxy_protocol(xprt, proxy_header_part->len);
+	if (ignore_remaining_data_result != HAPROXY_RET_CODE__SUCCESS) {
+		return ignore_remaining_data_result;
+	}
+	ret = HAPROXY_RET_CODE__IGNORE_LOCAL;
+
+	if (unlikely(svc_rqst_rearm_events(xprt, SVC_XPRT_FLAG_ADDED_RECV))) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
+			__func__, xprt, xprt->xp_fd);
+		ret = HAPROXY_RET_CODE__FAILURE;
+
+		XPRT_AUTO_TRACEPOINT(xprt, rearm_failed, TRACE_ERR,
+				     "Rearm failed");
+	} else {
+		XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, recv_exit, TRACE_DEBUG,
+					    "Exiting recv");
+	}
+
+	return ret;
+}
+
+static enum haproxy_ret_code handle_haproxy_header_cmd_v2_parse_address(
+	SVCXPRT *xprt, uint8_t family, ssize_t *remaining_length_to_read)
+{
+	enum haproxy_ret_code retval;
+
+	if (family == PP2_TRANS_STREAM_FAM_INET) {
+		struct proxy_header_addr_ip4_part addr_ip4;
+		retval = safe_read_and_update(xprt, PP2_ADDR_LEN_INET,
+					      remaining_length_to_read,
+					      &addr_ip4);
+		if (unlikely(retval != HAPROXY_RET_CODE__SUCCESS)) {
+			return retval;
+		}
+
+		struct sockaddr_in *ss4;
+		xprt->xp_proxy = xprt->xp_remote;
+		ss4 = (struct sockaddr_in *)&xprt->xp_remote.ss;
+		ss4->sin_family = AF_INET;
+		memcpy(&ss4->sin_addr, &addr_ip4.src_addr,
+		       sizeof(struct in_addr));
+		ss4->sin_port = addr_ip4.src_port;
+
+		return HAPROXY_RET_CODE__SUCCESS;
+	}
+	if (family == PP2_TRANS_STREAM_FAM_INET6) {
+		struct proxy_header_addr_ip6_part addr_ip6;
+		retval = safe_read_and_update(xprt, PP2_ADDR_LEN_INET6,
+					      remaining_length_to_read,
+					      &addr_ip6);
+		if (unlikely(retval != HAPROXY_RET_CODE__SUCCESS)) {
+			return retval;
+		}
+
+		struct sockaddr_in6 *ss6;
+		xprt->xp_proxy = xprt->xp_remote;
+		ss6 = (struct sockaddr_in6 *)&xprt->xp_remote.ss;
+		xprt->xp_remote.ss.ss_family = AF_INET6;
+		memcpy(&ss6->sin6_addr, &addr_ip6.src_addr,
+		       sizeof(struct in6_addr));
+		ss6->sin6_port = addr_ip6.src_port;
+
+		return HAPROXY_RET_CODE__SUCCESS;
+	}
+
+	/* NOTE: we don't support UNIX or UDP
+							 * sockets
+							 */
+	__warnx(TIRPC_DEBUG_FLAG_ERROR,
+		"%s: %p fd %d invalid proxy protocol = %0x2 "
+		"(will set dead)",
+		__func__, xprt, xprt->xp_fd, family);
+
+	return HAPROXY_RET_CODE__FAILURE;
+}
+
+static enum haproxy_ret_code handle_haproxy_header_cmd_v2_proxy(
+	SVCXPRT *xprt, struct proxy_header_part *proxy_header_part)
+{
+	enum haproxy_ret_code retval;
+	if (unlikely(is_remote_addr_set(xprt))) {
+		/* We don't allow more than one proxy protocol packet.
+							   Allowing it will cause a security vulnerability where
+							   at any point the client could sent a PP packet and
+							   change its IP to circumvent any IP based access rules.
+							*/
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: %p fd %d got more than one PP packet. "
+			"This is not allowed - terminating",
+			__func__, xprt, xprt->xp_fd);
+		return HAPROXY_RET_CODE__FAILURE;
+	}
+
+	ssize_t remaining_length_to_read = proxy_header_part->len;
+	retval = handle_haproxy_header_cmd_v2_parse_address(
+		xprt, proxy_header_part->fam, &remaining_length_to_read);
+	if (unlikely(retval != HAPROXY_RET_CODE__SUCCESS)) {
+		return retval;
+	}
+
+	/* we read all the proxy protocol header parts.
+			 * The remaining data left to read should be parsed
+			 * as TLV headers
+			 */
+	return handle_haproxy_tlv(xprt, remaining_length_to_read);
+}
+
+static enum haproxy_ret_code handle_haproxy_header(SVCXPRT *xprt)
+{
+	/* HA Proxy V2? */
+	ssize_t rlen;
+	uint32_t rest[2];
+	struct proxy_header_part s;
+
+	__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: %p fd %d potential haproxy packet",
+			__func__, xprt, xprt->xp_fd);
+
+	/* PEEK in order not to consume a non haproxy packet */
+	rlen = recv(xprt->xp_fd, rest, sizeof(rest), MSG_WAITALL | MSG_PEEK);
+	if (rlen != sizeof(rest)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d proxy header failed rest rlen = %zd "
+			"(will set dead)",
+			__func__, xprt, xprt->xp_fd, rlen);
+		return HAPROXY_RET_CODE__FAILURE;
+	}
+	rest[0] = ntohl(rest[0]);
+	rest[1] = ntohl(rest[1]);
+
+	if (rest[0] != PP2_SIG_UINT32_2 || rest[1] != PP2_SIG_UINT32_3) {
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: %p fd %d proxy header failed rest1=%08x rest2=%08x "
+			"(treat as regular rpc packet)",
+			__func__, xprt, xprt->xp_fd, (int) rest[0],
+			(int) rest[1]);
+		/* The signature does not fully match.
+		 * Flow should treat the packet as a regular rpc packet.*/
+		return HAPROXY_RET_CODE__NOT_HAPROXY;
+	}
+
+	rlen = recv(xprt->xp_fd, rest, sizeof(rest), MSG_WAITALL);
+	if (rlen != sizeof(rest)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d proxy header failed rest rlen = %zd "
+			"(will set dead)",
+			__func__, xprt, xprt->xp_fd, rlen);
+		return HAPROXY_RET_CODE__FAILURE;
+	}
+
+	rlen = recv(xprt->xp_fd, &s, sizeof(s), MSG_WAITALL);
+
+	if (rlen != sizeof(s)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d proxy header failed header rlen = %zd "
+			"(will set dead)",
+			__func__, xprt, xprt->xp_fd, rlen);
+		return HAPROXY_RET_CODE__FAILURE;
+	}
+
+	s.len = ntohs(s.len);
+	if (s.ver_cmd != PP2_VERSION2_CMD_PROXY) {
+		if (s.ver_cmd == PP2_VERSION2_CMD_LOCAL) {
+			return handle_haproxy_header_local_cmd(xprt, &s);
+		} else {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d invalid proxy command = %0x2 (will set dead)",
+				__func__, xprt, xprt->xp_fd, (int)s.ver_cmd);
+			return HAPROXY_RET_CODE__FAILURE;
+		}
+	}
+
+	return handle_haproxy_header_cmd_v2_proxy(xprt, &s);
+}
+
+static enum xprt_stat
+svc_vc_recv(SVCXPRT *xprt)
+{
+	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
+	struct svc_vc_xprt *xd = VC_DR(rec);
+	struct poolq_entry *have;
+	struct xdr_ioq_uv *uv;
+	struct xdr_ioq *xioq;
+	ssize_t rlen;
+	u_int flags;
+	int code;
+	bool hap_again = false;
+
+	XPRT_AUTO_TRACEPOINT(xprt, recv_start, TRACE_DEBUG, "recv_start");
+
+	/* no need for locking, only one svc_rqst_xprt_task() per event.
+	 * depends upon svc_rqst_rearm_events() for ordering.
+	 */
+	have = TAILQ_LAST(&rec->ioq.ioq_uv.uvqh.qh, poolq_head_s);
+	if (!have) {
+		xioq = xdr_ioq_create(xd->sx_dr.pagesz, xd->sx_dr.maxrec,
+				      UIO_FLAG_BUFQ);
+		(rec->ioq.ioq_uv.uvqh.qcount)++;
+		TAILQ_INSERT_TAIL(&rec->ioq.ioq_uv.uvqh.qh, &xioq->ioq_s, q);
+	} else {
+		xioq = _IOQ(have);
+	}
+
+	if (!xd->sx_fbtbc) {
+again:
+#ifdef USE_TLS
+               /* This is stunnel like TLS handshake request handling
+                * this internally does handshake if this is handshake msg*/
+		if (!((xprt)->xp_tls.not_first_packet)) {
+			if (is_handshake_msg(xprt)) {
+				(xprt)->xp_tls.not_first_packet = true;
+				xd->sx_fbtbc = 0;
+				if (unlikely(svc_rqst_rearm_events(xprt,
+								SVC_XPRT_FLAG_ADDED_RECV))) {
+					__warnx(TIRPC_DEBUG_FLAG_ERROR,
+							"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
+							__func__, xprt, xprt->xp_fd);
+					SVC_DESTROY(xprt);
+				}
+				return SVC_STAT(xprt);
+			}
+			(xprt)->xp_tls.not_first_packet = true;
+		}
+		rlen = svc_tls_recv(xprt, &xd->sx_fbtbc, BYTES_PER_XDR_UNIT,
+				    hap_again ? MSG_DONTWAIT : MSG_WAITALL);
+#else
+		rlen = recv(xprt->xp_fd, &xd->sx_fbtbc, BYTES_PER_XDR_UNIT,
+				    hap_again ? MSG_DONTWAIT : MSG_WAITALL);
+#endif
+
+		if (unlikely(rlen < 0)) {
+			code = errno;
+
+			if (code == EAGAIN || code == EWOULDBLOCK) {
+				__warnx(hap_again ? TIRPC_DEBUG_FLAG_SVC_VC
+						  : TIRPC_DEBUG_FLAG_WARN,
+					"%s: %p fd %d recv errno %d (try again)",
+					"svc_vc_wait", xprt, xprt->xp_fd, code);
+				if (unlikely(svc_rqst_rearm_events(
+						xprt,
+						SVC_XPRT_FLAG_ADDED_RECV))) {
+					__warnx(TIRPC_DEBUG_FLAG_ERROR,
+						"%s: %p fd %d svc_rqst_rearm_events failed (will set dead) - clientip: %s:%u",
+						"svc_vc_wait",
+						xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+					SVC_DESTROY(xprt);
+					code = EINVAL;
+				}
+				XPRT_AUTO_TRACEPOINT(xprt, recv_eagin,
+					TRACE_DEBUG, "recv got EAGAIN");
+				return SVC_STAT(xprt);
+			}
+			__warnx(TIRPC_DEBUG_FLAG_WARN,
+				"%s: %p fd %d recv errno %d (will set dead) - clientip: %s:%u",
+				"svc_vc_wait", xprt, xprt->xp_fd, code, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+			SVC_DESTROY(xprt);
+
+			XPRT_AUTO_TRACEPOINT(xprt, recv_err,
+				TRACE_WARNING, "recv got errno: {}", code);
+			return SVC_STAT(xprt);
+		}
+
+		if (unlikely(!rlen)) {
+			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+				"%s: %p fd %d recv closed (will set dead) - clientip: %s:%u",
+				"svc_vc_wait", xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+			SVC_DESTROY(xprt);
+
+			XPRT_AUTO_TRACEPOINT(xprt, recv_empty,
+				TRACE_DEBUG, "recv EOF");
+
+			return SVC_STAT(xprt);
+		}
+
+		xd->sx_fbtbc = (int32_t)ntohl((long)xd->sx_fbtbc);
+
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"sx_fbtbc = %08x", (int)xd->sx_fbtbc);
+
+		if (xd->sx_fbtbc == PP2_SIG_UINT32) {
+			/* Since this is haproxy header clear off sx_fbtbc
+			 * In case of HAPROXY_RET_CODE__IGNORE_LOCAL,
+			 * handle_haproxy_header() do rearm the xprt recv fd.
+			 * causing a race if the thread gets scheduled
+			 * out after rearm and epoll_wait gets data available
+			 * event, then new recv endup in elsecase
+			 * "if (!xd->sx_fbtbc)"
+			 * and will cause uv to NULL */
+			xd->sx_fbtbc = 0;
+
+			/* HA Proxy V2? */
+			enum haproxy_ret_code ret = handle_haproxy_header(xprt);
+			switch (ret) {
+			case HAPROXY_RET_CODE__SUCCESS:
+				if (!update_and_notify_remote_address_set(xprt)) {
+					SVC_DESTROY(xprt);
+					return SVC_STAT(xprt);
+				}
+				/* Now look to see if there's more... */
+				hap_again = true;
+#ifdef USE_TLS
+				xprt->xp_tls.not_first_packet = false;
+#endif
+				goto again;
+			case HAPROXY_RET_CODE__FAILURE:
+				SVC_DESTROY(xprt);
+				return SVC_STAT(xprt);
+			case HAPROXY_RET_CODE__IGNORE_LOCAL:
+				return SVC_STAT(xprt);
+			case HAPROXY_RET_CODE__NOT_HAPROXY:
+				xd->sx_fbtbc = PP2_SIG_UINT32;
+				break;
+			}
+		}
+
+		flags = UIO_FLAG_FREE | UIO_FLAG_MORE;
+
+		if (xd->sx_fbtbc & LAST_FRAG) {
+			xd->sx_fbtbc &= (~LAST_FRAG);
+			flags = UIO_FLAG_FREE;
+		}
+
+		if (unlikely(!xd->sx_fbtbc)) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d fragment is zero (will set dead) - clientip: %s:%u",
+				__func__, xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+			SVC_DESTROY(xprt);
+
+			XPRT_AUTO_TRACEPOINT(xprt, recv_no_record,
+				TRACE_ERR,
+				"Recv fragmet is zero (will set dead)");
+
+			return SVC_STAT(xprt);
+		}
+
+		/* one buffer per fragment */
+		uv = xdr_ioq_uv_create(xd->sx_fbtbc, flags);
+		(xioq->ioq_uv.uvqh.qcount)++;
+		TAILQ_INSERT_TAIL(&xioq->ioq_uv.uvqh.qh, &uv->uvq, q);
+	} else {
+		uv = IOQ_(TAILQ_LAST(&xioq->ioq_uv.uvqh.qh, poolq_head_s));
+		flags = uv->u.uio_flags;
+	}
+#ifdef USE_TLS
+	rlen = svc_tls_recv(xprt, uv->v.vio_tail, xd->sx_fbtbc, MSG_DONTWAIT);
+#else
+	rlen = recv(xprt->xp_fd, uv->v.vio_tail, xd->sx_fbtbc, MSG_DONTWAIT);
+#endif
+
+	if (unlikely(rlen < 0)) {
+		code = errno;
+
+		if (code == EAGAIN || code == EWOULDBLOCK) {
+			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+				"%s: %p fd %d recv errno %d (try again) - clientip: %s:%u",
+				__func__, xprt, xprt->xp_fd, code, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+			if (unlikely(svc_rqst_rearm_events(
+						xprt,
+						SVC_XPRT_FLAG_ADDED_RECV))) {
+				__warnx(TIRPC_DEBUG_FLAG_ERROR,
+					"%s: %p fd %d svc_rqst_rearm_events failed (will set dead) - clientip: %s:%u",
+					__func__, xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+				SVC_DESTROY(xprt);
+				code = EINVAL;
+			}
+
+			XPRT_AUTO_TRACEPOINT(xprt, recv_eagin2,
+					TRACE_DEBUG, "recv got EAGIN");
+
+			return SVC_STAT(xprt);
+		}
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d recv errno %d (will set dead) - clientip: %s:%u",
+			__func__, xprt, xprt->xp_fd, code, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+		SVC_DESTROY(xprt);
+
+		XPRT_AUTO_TRACEPOINT(xprt, recv_error,
+				TRACE_ERR, "recv got errno: {}", code);
+
+		return SVC_STAT(xprt);
+	}
+
+	if (unlikely(!rlen)) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: %p fd %d recv closed (will set dead) - clientip: %s:%u",
+			__func__, xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+		SVC_DESTROY(xprt);
+
+		XPRT_AUTO_TRACEPOINT(xprt, recv_closed,
+				TRACE_INFO, "recv closed");
+
+		return SVC_STAT(xprt);
+	}
+
+	XPRT_AUTO_TRACEPOINT(xprt, recv_bytes,
+		TRACE_DEBUG, "recv {} bytes in sx_fbtbc: {}", rlen,
+			xd->sx_fbtbc);
+
+	uv->v.vio_tail += rlen;
+	xd->sx_fbtbc -= rlen;
+
+	__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+		"%s: %p fd %d recv %zd, need %" PRIu32 ", flags %x",
+		__func__, xprt, xprt->xp_fd, rlen, xd->sx_fbtbc, flags);
+
+	if (xd->sx_fbtbc || (flags & UIO_FLAG_MORE)) {
+		if (unlikely(svc_rqst_rearm_events(xprt,
+						   SVC_XPRT_FLAG_ADDED_RECV))) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d svc_rqst_rearm_events failed (will set dead) - clientip: %s:%u",
+				__func__, xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+			XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, rearm_failed,
+				TRACE_ERR, "Rearm failed");
+			SVC_DESTROY(xprt);
+		} else {
+			XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, recv_exit,
+				TRACE_DEBUG, "recv exit");
+#if USE_TLS
+			if (svc_tls_datapending(xprt) == true)
+				svc_tls_send_event(xprt);
+#endif
+		}
+
+		return SVC_STAT(xprt);
+	}
+
+	/* finished a request */
+	(rec->ioq.ioq_uv.uvqh.qcount)--;
+	TAILQ_REMOVE(&rec->ioq.ioq_uv.uvqh.qh, &xioq->ioq_s, q);
+	xdr_ioq_reset(xioq, 0);
+
+	if (!is_remote_addr_set(xprt)) {
+		if (!update_and_notify_remote_address_set(xprt)) {
+			SVC_DESTROY(xprt);
+			return SVC_STAT(xprt);
+		}
+	}
+
+	if (unlikely(svc_rqst_rearm_events(xprt, SVC_XPRT_FLAG_ADDED_RECV))) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d svc_rqst_rearm_events failed (will set dead) - clientip: %s:%u",
+			__func__, xprt, xprt->xp_fd, xprt->xp_clnt_addr, xprt->xp_clnt_port);
+		xdr_ioq_destroy(xioq, xioq->ioq_s.qsize);
+		SVC_DESTROY(xprt);
+
+		XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, rearm_failed,
+			TRACE_ERR, "Rearm failed");
+
+		return SVC_STAT(xprt);
+	}
+
+#if USE_TLS
+	if (svc_tls_datapending(xprt) == true)
+		svc_tls_send_event(xprt);
+#endif
+
+	XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, calling_svc_request,
+		TRACE_DEBUG, "Calling svc_request");
+
+	return svc_request(xprt, xioq->xdrs);
+}
+
+static enum xprt_stat
+svc_vc_decode(struct svc_req *req)
+{
+	XDR *xdrs = req->rq_xdrs;
+	SVCXPRT *xprt = req->rq_xprt;
+
+	/* No need, already positioned to beginning ...
+	XDR_SETPOS(xdrs, 0);
+	 */
+	xdrs->x_op = XDR_DECODE;
+	rpc_msg_init(&req->rq_msg);
+
+	if (!xdr_dplx_decode(xdrs, &req->rq_msg)) {
+		/* stream is unsynchronized beyond recovery */
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d failed (will set dead)",
+			__func__, xprt, xprt->xp_fd);
+		SVC_DESTROY(xprt);
+		return SVC_STAT(xprt);
+	}
+
+	/* in order of likelihood */
+	if (req->rq_msg.rm_direction == CALL) {
+		/* an ordinary call header */
+		return xprt->xp_dispatch.process_cb(req);
+	}
+
+	if (req->rq_msg.rm_direction == REPLY) {
+		/* reply header (xprt OK) */
+		return clnt_req_process_reply(xprt, req);
+	}
+
+	__warnx(TIRPC_DEBUG_FLAG_WARN,
+		"%s: %p fd %d failed direction %" PRIu32
+		" (will set dead)",
+		__func__, xprt, xprt->xp_fd,
+		req->rq_msg.rm_direction);
+	SVC_DESTROY(xprt);
+	return SVC_STAT(xprt);
+}
+
+static void
+svc_vc_checksum(struct svc_req *req, void *data, size_t length)
+{
+	req->rq_cksum =
+#if 1
+	/* CithHash64 is -substantially- faster than crc32c from FreeBSD
+	 * SCTP, so prefer it until fast crc32c bests it */
+		CityHash64WithSeed(data, MIN(256, length), 103);
+#else
+		calculate_crc32c(0, data, MIN(256, length));
+#endif
+}
+
+static enum xprt_stat
+svc_vc_reply(struct svc_req *req)
+{
+	SVCXPRT *xprt = req->rq_xprt;
+	struct xdr_ioq *xioq;
+
+	/* Nb, we should probably use getpagesize() on Unix.  Need
+	 * an equivalent for Windows.
+	 */
+	xioq = xdr_ioq_create(RPC_MAXDATA_DEFAULT,
+			      __svc_params->ioq.send_max + RPC_MAXDATA_DEFAULT,
+			      UIO_FLAG_FREE);
+
+	if (!xdr_reply_encode(xioq->xdrs, &req->rq_msg)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d xdr_reply_encode failed (will set dead)",
+			__func__, xprt, xprt->xp_fd);
+		return (XPRT_DIED);
+	}
+	xdr_tail_update(xioq->xdrs);
+
+	if (req->rq_msg.rm_reply.rp_stat == MSG_ACCEPTED
+	 && req->rq_msg.rm_reply.rp_acpt.ar_stat == SUCCESS
+	 && req->rq_auth
+	 && !SVCAUTH_WRAP(req, xioq->xdrs)) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d SVCAUTH_WRAP failed (will set dead)",
+			__func__, xprt, xprt->xp_fd);
+		return (XPRT_DIED);
+	}
+	xdr_tail_update(xioq->xdrs);
+
+	xioq->xdrs[0].x_lib[1] = (void *)req->rq_xprt;
+	svc_ioq_write_now(req->rq_xprt, xioq);
+	return (XPRT_IDLE);
+}
+
+static void
+svc_vc_override_ops(SVCXPRT *xprt, SVCXPRT *rendezvous)
+{
+	static struct xp_ops ops;
+
+	/* VARIABLES PROTECTED BY ops_lock: ops, xp_type */
+	mutex_lock(&ops_lock);
+
+	xprt->xp_type = XPRT_TCP;
+
+	if (ops.xp_recv == NULL) {
+		ops.xp_recv = svc_vc_recv;
+		ops.xp_stat = svc_vc_stat;
+		ops.xp_decode = svc_vc_decode;
+		ops.xp_reply = svc_vc_reply;
+		ops.xp_checksum = svc_vc_checksum;
+		ops.xp_unlink = svc_vc_unlink_it;
+		ops.xp_unref_user_data = NULL;	/* no default */
+		ops.xp_destroy = svc_vc_destroy_it;
+		ops.xp_control = svc_vc_control;
+		ops.xp_free_user_data = NULL;	/* no default */
+	}
+	svc_override_ops(&ops, rendezvous);
+	xprt->xp_ops = &ops;
+	mutex_unlock(&ops_lock);
+}
+
+static void
+svc_vc_rendezvous_ops(SVCXPRT *xprt)
+{
+	static struct xp_ops ops;
+	extern mutex_t ops_lock;
+
+	mutex_lock(&ops_lock);
+
+	xprt->xp_type = XPRT_TCP_RENDEZVOUS;
+
+	if (ops.xp_recv == NULL) {
+		ops.xp_recv = svc_vc_rendezvous;
+		ops.xp_stat = svc_rendezvous_stat;
+		ops.xp_decode = (svc_req_fun_t)abort;
+		ops.xp_reply = (svc_req_fun_t)abort;
+		ops.xp_checksum = NULL;		/* not used */
+		ops.xp_unlink = svc_vc_unlink_it;
+		ops.xp_unref_user_data = NULL;	/* no default */
+		ops.xp_destroy = svc_vc_destroy_it;
+		ops.xp_control = svc_vc_rendezvous_control;
+		ops.xp_free_user_data = NULL;	/* no default */
+	}
+	xprt->xp_ops = &ops;
+	mutex_unlock(&ops_lock);
+}
+
+/*
+ * Get the effective UID of the sending process. Used by rpcbind, keyserv
+ * and rpc.yppasswdd on AF_LOCAL.
+ */
+int
+__rpc_get_local_uid(SVCXPRT *transp, uid_t *uid)
+{
+	int sock, ret;
+	gid_t egid;
+	uid_t euid;
+	struct sockaddr *sa;
+
+	sock = transp->xp_fd;
+	sa = (struct sockaddr *)&transp->xp_remote.ss;
+	if (sa->sa_family == AF_LOCAL) {
+		ret = getpeereid(sock, &euid, &egid);
+		if (ret == 0)
+			*uid = euid;
+		return (ret);
+	} else
+		return (-1);
+}

@@ -1,20 +1,61 @@
+# This repository is the authoritative source of libntirpc-sys.
+# VFSI consumes published releases or an explicit local Cargo path override.
 [package]
 name = "libntirpc-sys"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
-links = "ntirpc"
+rust-version = "1.88"
 authors = ["Ming Chen <v.mingchen@gmail.com>"]
-license = "BSD-3-Clause"
 description = "Low-level bindings for the libntirpc library."
-repository = "https://github.com/vmingchen/libntirpc-sys"
 readme = "README.md"
-keywords = ["xdr", "rpc", "tirpc", "ntirpc"]
+license = "BSD-3-Clause"
+repository = "https://github.com/vmingchen/libntirpc-sys"
+keywords = [
+    "xdr",
+    "rpc",
+    "tirpc",
+    "ntirpc",
+    "nfs",
+]
+build = "build.rs"
+links = "ntirpc"
 
-[dependencies]
+# Everything is explicitly listed: no build-generated examples, tests, or
+# binaries are picked up implicitly.
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 
-[build-dependencies]
-bindgen = "0.72"
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+fuzzing = []
+rpcsec-gss = []
+
+[lib]
+name = "libntirpc_sys"
+path = "src/lib.rs"
+
+[[example]]
+name = "hello_client"
+path = "examples/hello_client.rs"
+
+[[example]]
+name = "hello_server"
+path = "examples/hello_server.rs"
 
 [dev-dependencies]
 libc = "0.2"
 
+[[test]]
+name = "source_contract"
+path = "tests/source_contract.rs"
+
+[build-dependencies]
+cc = "1"
+bindgen = { version = "=0.73.2", default-features = false, features = ["runtime"] }
+pkg-config = "0.3"
