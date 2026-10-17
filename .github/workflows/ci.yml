@@ -19,6 +19,8 @@ jobs:
       - run: cargo test --no-default-features
       - name: Check quoted bindgen arguments
         run: bash tests/check-bindgen-env.sh
+      - name: Check native inline XDR regressions
+        run: bash tests/check-native-xdr.sh
       - name: Verify packaged native source
         run: cargo package --locked
       - name: Test the exact packaged source offline

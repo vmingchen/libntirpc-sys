@@ -771,13 +771,8 @@ xdr_array_decode(XDR *xdrs, char **cpp, u_int *sizep, u_int maxsize,
 	uint32_t size;
 	bool stat = true;
 
-	if (maxsize > (UINT_MAX / selem)) {
-		__warnx(TIRPC_DEBUG_FLAG_ERROR,
-			"%s:%u ERROR maxsize %u > max %u",
-			__func__, __LINE__,
-			maxsize, (UINT_MAX / selem));
+	if (!selem)
 		return (false);
-	}
 
 	/*
 	 * first deal with the length since xdr arrays are counted-arrays
@@ -795,6 +790,9 @@ xdr_array_decode(XDR *xdrs, char **cpp, u_int *sizep, u_int maxsize,
 			size, maxsize);
 		return (false);
 	}
+	/* Bound the allocation by the actual count, not the protocol limit. */
+	if (size > (UINT_MAX / selem))
+		return (false);
 	*sizep = (u_int)size;		/* only valid size */
 
 	/*
