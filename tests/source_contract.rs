@@ -1,4 +1,4 @@
-// Regression guards for the native changes that replace unsafe runtime shims.
+// Regression guards for the upstream native fixes that replace unsafe runtime shims.
 #[test]
 fn pinned_source_contains_decoded_reply_verifier_fix() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -14,7 +14,7 @@ fn pinned_source_contains_decoded_reply_verifier_fix() {
 }
 
 #[test]
-fn gss_allocation_is_locally_zeroed_without_global_hook() {
+fn gss_allocation_is_zeroed_without_global_hook() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(root.join("vendor/ntirpc/src/auth_gss.c")).unwrap();
     assert!(source.contains("struct rpc_gss_data *gd = mem_zalloc(sizeof(*gd));"));

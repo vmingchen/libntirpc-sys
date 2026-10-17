@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2
+
+- Fix XDR string ownership on decode failure, string allocation overflow,
+  and array allocation validation against the decoded count.
+- Initialize authentication padding in RPC call and reply encoders.
+- Respect UNIX transport address lengths and reject malformed universal
+  address port components and UNIX paths.
+- Return protocol errors from the hello RPC examples.
+- Preserve unchanged native source timestamps and support quoted bindgen
+  arguments and target-specific bindgen environment overrides.
+- Add native regression tests and exclude editor swap files from packages.
+
+## 0.3.1
+
+- Update the bundled ntirpc pin to upstream merge commit
+  `ff0ee01fc4960a72f70f21ca6a778c0963732a7b`, which includes PR #416's GSS
+  client authentication zero-initialization fix. This is identical to the
+  runtime fix bundled in 0.3.0; the GSS allocation fix no longer needs a
+  local patch.
+
 ## 0.3.0
 
 - Build packaged ntirpc v15.7 (`69c40fecf260ff9172f6dd9d7b468b0a541808bc`)

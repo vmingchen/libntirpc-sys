@@ -67,8 +67,8 @@ which prints `Hello, Alice!`. Both arguments are optional (`name` defaults to
 
 ## Native build
 
-Normal Cargo builds compile the packaged ntirpc v15.7 source at commit
-`69c40fecf260ff9172f6dd9d7b468b0a541808bc`. No source is downloaded during
+Normal Cargo builds compile the packaged ntirpc source based on v15.7 at commit
+`ff0ee01fc4960a72f70f21ca6a778c0963732a7b`. No source is downloaded during
 the build, and a system-installed libntirpc is neither discovered nor linked.
 The archive is static and position-independent; RCU and optional Kerberos
 libraries remain system dependencies. Linux is the supported native platform.
@@ -77,10 +77,11 @@ This revision contains [PR #414](https://github.com/nfs-ganesha/ntirpc/pull/414)
 which validates decoded RPC reply verifiers inside ntirpc. The bindings no
 longer replace transport callbacks or depend on a copied private layout.
 
-The build and GSS allocation patches are documented in [vendor/UPSTREAM.md](vendor/UPSTREAM.md):
-static archive construction and zero-initialized GSS credential allocation.
-The latter replaces our process-global allocator hook; PR #414 does not fix
-that separate initialization defect. Upstream license notices are preserved.
+This revision also contains [PR #416](https://github.com/nfs-ganesha/ntirpc/pull/416),
+which zero-initializes GSS credential state through `mem_zalloc`, replacing our
+process-global allocator hook. Both runtime fixes are now upstream. Local build
+and correctness patches are documented in [vendor/UPSTREAM.md](vendor/UPSTREAM.md)
+and [vendor/PATCHES.md](vendor/PATCHES.md). Upstream license notices are preserved.
 
 Install the build dependencies on Ubuntu:
 
