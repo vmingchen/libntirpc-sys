@@ -22,3 +22,7 @@ Keep the behavioral regression tests when refreshing the upstream source.
 - `src/rpc_generic.c`: reject malformed decimal port octets and UNIX
   pathnames that would be truncated or are not absolute. Covered by invalid
   input and valid IPv4/IPv6/UNIX round trips in `tests/native_address.c`.
+
+- `ntirpc/rpc/xdr_inline.h`: reject a string length whose terminating NUL
+  would overflow the allocation size. The allocator-counting boundary test
+  in `tests/native_xdr.c` uses only a four-byte input.
