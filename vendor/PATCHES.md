@@ -18,3 +18,7 @@ Keep the behavioral regression tests when refreshing the upstream source.
 - `src/rpc_generic.c`: size UNIX universal-address output for the bounded
   pathname and respect the transport buffer's logical length. Covered by
   guard-allocation and short-buffer regressions in `tests/native_address.c`.
+
+- `src/rpc_generic.c`: reject malformed decimal port octets and UNIX
+  pathnames that would be truncated or are not absolute. Covered by invalid
+  input and valid IPv4/IPv6/UNIX round trips in `tests/native_address.c`.

@@ -868,6 +868,25 @@ __rpc_taddr2uaddr_af(int af, const struct netbuf *nbuf)
 	return ret;
 }
 
+/* Universal-address port components are decimal bytes, not C integers. */
+static bool
+uaddr_port_octet(const char *text, unsigned *value)
+{
+	unsigned result = 0;
+
+	if (!*text)
+		return false;
+	for (; *text; ++text) {
+		if (*text < '0' || *text > '9')
+			return false;
+		result = result * 10 + (*text - '0');
+		if (result > 255)
+			return false;
+	}
+	*value = result;
+	return true;
+}
+
 struct netbuf *
 __rpc_uaddr2taddr_af(int af, const char *uaddr)
 {
@@ -890,17 +909,22 @@ __rpc_uaddr2taddr_af(int af, const char *uaddr)
 	 * AF_LOCAL addresses are expected to be absolute
 	 * pathnames.
 	 */
-	if (*addrstr != '/') {
+	if (af == AF_LOCAL) {
+		if (*addrstr != '/' || strlen(addrstr) >= sizeof(sun->sun_path))
+			goto out;
+	} else {
 		p = strrchr(addrstr, '.');
 		if (p == NULL)
 			goto out;
-		portlo = (unsigned)atoi(p + 1);
+		if (!uaddr_port_octet(p + 1, &portlo))
+			goto out;
 		*p = '\0';
 
 		p = strrchr(addrstr, '.');
 		if (p == NULL)
 			goto out;
-		porthi = (unsigned)atoi(p + 1);
+		if (!uaddr_port_octet(p + 1, &porthi))
+			goto out;
 		*p = '\0';
 		port = (porthi << 8) | portlo;
 	}
