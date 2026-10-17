@@ -56,18 +56,33 @@ unsafe extern "C" fn hello_process(req: *mut svc_req) -> xprt_stat {
         // NULL and svc_sendreply() skips the auth wrap, which is what actually
         // encodes the result body (so the client would get an empty reply).
         let mut no_dispatch = false;
-        if svc_auth_authenticate(req, &mut no_dispatch) != auth_stat_AUTH_OK {
+        let authentication = svc_auth_authenticate(req, &mut no_dispatch);
+        if authentication != auth_stat_AUTH_OK {
+            return svcerr_auth(req, authentication);
+        }
+        if no_dispatch {
             return xprt_stat_XPRT_IDLE;
+        }
+        if (*req).rq_msg.cb_prog != HELLO_PROG {
+            return svcerr_noprog(req);
+        }
+        if (*req).rq_msg.cb_vers != HELLO_VERS {
+            return svcerr_progvers(req, HELLO_VERS, HELLO_VERS);
+        }
+        match (*req).rq_msg.cb_proc {
+            0 => {
+                (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = Some(xdr_void);
+                (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ = std::ptr::null_mut();
+                return svc_sendreply(req);
+            }
+            1 => {}
+            _ => return svcerr_noproc(req),
         }
 
         let mut name: *mut c_char = std::ptr::null_mut();
 
         if !xdr_wrapstring((*req).rq_xdrs, &mut name) {
-            // Could not decode the argument; tell the client about it.
-            (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = Some(xdr_void);
-            (*req).rq_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ = std::ptr::null_mut();
-            svc_sendreply(req);
-            return xprt_stat_XPRT_IDLE;
+            return svcerr_decode(req);
         }
         let name_c = std::ffi::CStr::from_ptr(name);
         let reply_c = CString::new(format!("Hello, {}!", name_c.to_string_lossy())).unwrap();
@@ -179,3 +194,7 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hello_server_tests.rs"]
+mod tests;

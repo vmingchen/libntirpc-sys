@@ -62,7 +62,10 @@ fn main() {
         params.max_events = 16;
         params.alloc_cb = Some(svc_req_alloc);
         params.free_cb = Some(svc_req_free);
-        svc_init(&mut params);
+        if !svc_init(&mut params) {
+            eprintln!("svc_init failed");
+            std::process::exit(1);
+        }
 
         // rpc_call() performs a one-shot synchronous RPC: send a name,
         // receive the greeting.
