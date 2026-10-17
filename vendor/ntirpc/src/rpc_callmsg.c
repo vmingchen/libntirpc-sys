@@ -102,6 +102,9 @@ xdr_call_encode(XDR *xdrs, struct rpc_msg *cmsg)
 		IXDR_PUT_INT32(buf, oa->oa_length);
 		if (oa->oa_length) {
 			memcpy(buf, oa->oa_body, oa->oa_length);
+			/* XDR padding must not expose previous buffer contents. */
+			memset((char *)buf + oa->oa_length, 0,
+			       RNDUP(oa->oa_length) - oa->oa_length);
 			buf += RNDUP(oa->oa_length) / sizeof (int32_t);
 		}
 		oa = &cmsg->cb_verf;
@@ -109,9 +112,9 @@ xdr_call_encode(XDR *xdrs, struct rpc_msg *cmsg)
 		IXDR_PUT_INT32(buf, oa->oa_length);
 		if (oa->oa_length) {
 			memcpy(buf, oa->oa_body, oa->oa_length);
-			/* no real need....
-			buf += RNDUP(oa->oa_length) / sizeof (int32_t);
-			*/
+			/* XDR padding must not expose previous buffer contents. */
+			memset((char *)buf + oa->oa_length, 0,
+			       RNDUP(oa->oa_length) - oa->oa_length);
 		}
 	} else {
 		/* nTI-RPC handles multiple buffers */

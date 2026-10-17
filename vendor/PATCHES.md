@@ -10,3 +10,7 @@ Keep the behavioral regression tests when refreshing the upstream source.
 - `ntirpc/rpc/xdr_inline.h`: check array allocation overflow against the
   decoded count and reject zero-sized elements. Covered by the inline C
   regressions in `tests/native_xdr.c`.
+
+- `src/rpc_callmsg.c` and `src/rpc_dplx_msg.c`: initialize authentication
+  padding in the inline call and reply encoders. Covered by the sentinel-buffer encoding regression
+  in `tests/xdr.rs`, including maximum-size authentication bodies.
