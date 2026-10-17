@@ -126,7 +126,7 @@ fn main() {
             .expect("install Kerberos development packages");
     }
     println!("cargo:rustc-link-lib=pthread");
-    let mut bindings = bindgen::Builder::default()
+    let bindings = bindgen::Builder::default()
         .header("src/wrapper.h")
         .clang_arg(format!("--target={target}"))
         .clang_arg(format!("-I{}", include.display()))
@@ -148,9 +148,8 @@ fn main() {
         .blocklist_function("qecvt")
         .blocklist_function("qfcvt")
         .blocklist_function("qgcvt");
-    if let Some(flags) = env::var_os("BINDGEN_EXTRA_CLANG_ARGS") {
-        bindings = bindings.clang_args(flags.to_string_lossy().split_whitespace());
-    }
+    // Bindgen reads BINDGEN_EXTRA_CLANG_ARGS itself, including shell quoting
+    // and target-specific overrides. Do not split or append it a second time.
     bindings
         .generate()
         .expect("generate bundled ntirpc bindings")

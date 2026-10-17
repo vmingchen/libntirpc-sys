@@ -17,6 +17,8 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
       - run: cargo test --no-default-features
+      - name: Check quoted bindgen arguments
+        run: bash tests/check-bindgen-env.sh
       - name: Verify packaged native source
         run: cargo package --locked
       - name: Test the exact packaged source offline
