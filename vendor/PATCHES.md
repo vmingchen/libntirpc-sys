@@ -14,3 +14,7 @@ Keep the behavioral regression tests when refreshing the upstream source.
 - `src/rpc_callmsg.c` and `src/rpc_dplx_msg.c`: initialize authentication
   padding in the inline call and reply encoders. Covered by the sentinel-buffer encoding regression
   in `tests/xdr.rs`, including maximum-size authentication bodies.
+
+- `src/rpc_generic.c`: size UNIX universal-address output for the bounded
+  pathname and respect the transport buffer's logical length. Covered by
+  guard-allocation and short-buffer regressions in `tests/native_address.c`.

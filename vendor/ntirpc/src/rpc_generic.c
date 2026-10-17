@@ -783,7 +783,23 @@ __rpc_taddr2uaddr_af(int af, const struct netbuf *nbuf)
 	if (nbuf->len <= 0)
 		goto out;
 
-	/* XXX check (fix) this */
+	if (af == AF_LOCAL) {
+		size_t offset = offsetof(struct sockaddr_un, sun_path);
+		size_t available, length;
+
+		if (nbuf->len < offset)
+			return NULL;
+		sun = nbuf->buf;
+		available = nbuf->len - offset;
+		if (available > sizeof(sun->sun_path))
+			available = sizeof(sun->sun_path);
+		length = strnlen(sun->sun_path, available);
+		ret = mem_zalloc(length + 1);
+		memcpy(ret, sun->sun_path, length);
+		return ret;
+	}
+
+	/* Space for an IP address and two decimal port octets. */
 #define RETURN_SIZE (INET6_ADDRSTRLEN + (2 * 6) + 1)
 	ret = mem_zalloc(RETURN_SIZE);
 
@@ -843,19 +859,6 @@ __rpc_taddr2uaddr_af(int af, const struct netbuf *nbuf)
 	}
 	break;
 #endif /* VSOCK */
-	case AF_LOCAL:
-		sun = nbuf->buf;
-		/* if (asprintf(&ret, "%.*s", (int)(sun->sun_len -
-		   offsetof(struct sockaddr_un, sun_path)),
-		   sun->sun_path) < 0) */
-		if (sprintf(ret, "%.*s",
-			    (int)(sizeof(*sun) -
-				  offsetof(struct sockaddr_un, sun_path)),
-			    sun->sun_path) < 0) {
-			mem_free(ret, RETURN_SIZE);
-			return NULL;
-		}
-		break;
 	default:
 		mem_free(ret, RETURN_SIZE);
 		return NULL;

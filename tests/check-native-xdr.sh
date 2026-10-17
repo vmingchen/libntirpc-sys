@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise inline C APIs from the same installed headers consumers receive.
+# Exercise native C APIs from the same installed headers consumers receive.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 test_dir=$(mktemp -d)
@@ -17,10 +17,13 @@ else:
 PY
 )
 read -r -a dependency_flags <<< "$(pkg-config --cflags --libs liburcu-bp krb5-gssapi)"
-"${CC:-cc}" -D_GNU_SOURCE -DINET6 \
+for fixture in tests/native_*.c; do
+    executable="$test_dir/$(basename "$fixture" .c)"
+    "${CC:-cc}" -D_GNU_SOURCE -DINET6 \
     -I"$native_out/native-install/include/ntirpc" \
     -I"$native_out/native-install/include" \
     -I"$native_out/bundled-build" \
-    tests/native_xdr.c "$native_out/native-install/lib/libntirpc.a" \
-    "${dependency_flags[@]}" -lpthread -o "$test_dir/native-xdr"
-"$test_dir/native-xdr"
+    "$fixture" "$native_out/native-install/lib/libntirpc.a" \
+    "${dependency_flags[@]}" -lpthread -o "$executable"
+    "$executable"
+done
