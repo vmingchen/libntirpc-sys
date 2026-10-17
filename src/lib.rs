@@ -122,3 +122,7 @@ mod test {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/xdr.rs"]
+mod xdr_regressions;

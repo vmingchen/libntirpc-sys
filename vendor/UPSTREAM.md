@@ -23,3 +23,5 @@ Two local patches are maintained:
 Upstream license notices are retained in vendor/ntirpc/COPYING and source files.
 Monitoring, LTTng, RDMA and TLS are disabled; IPv6 matches upstream defaults.
 RPCSEC_GSS is compiled only when the rpcsec-gss Cargo feature is enabled.
+
+Additional correctness patches are recorded in [PATCHES.md](PATCHES.md).

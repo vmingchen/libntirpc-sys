@@ -957,7 +957,9 @@ xdr_string_decode(XDR *xdrs, char **cpp, u_int maxsize)
 
 	ret = xdr_opaque_decode(xdrs, sp, size);
 	if (!ret) {
-		mem_free(sp, nodesize);
+		/* Only storage allocated by this call belongs to the decoder. */
+		if (!*cpp)
+			mem_free(sp, nodesize);
 		return (ret);
 	}
 	sp[size] = '\0';
