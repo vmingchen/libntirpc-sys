@@ -1,21 +1,7 @@
-use std::{env, path::PathBuf, process::Command};
+mod build_support;
 
-fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
-    std::fs::create_dir_all(destination).expect("create native source directory");
-    for entry in std::fs::read_dir(source).expect("read packaged native source") {
-        let entry = entry.expect("native source entry");
-        let target = destination.join(entry.file_name());
-        if entry.file_type().expect("native source type").is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else {
-            assert!(
-                entry.file_type().expect("native source type").is_file(),
-                "native source must contain only regular files and directories"
-            );
-            std::fs::copy(entry.path(), target).expect("copy native source");
-        }
-    }
-}
+use build_support::copy_tree;
+use std::{env, path::PathBuf, process::Command};
 
 fn run(command: &mut Command) {
     let status = command

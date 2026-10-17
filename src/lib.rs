@@ -126,3 +126,7 @@ mod test {
 #[cfg(test)]
 #[path = "../tests/xdr.rs"]
 mod xdr_regressions;
+
+#[cfg(test)]
+#[path = "../build_support.rs"]
+mod build_support;

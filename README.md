@@ -77,7 +77,7 @@ This revision contains [PR #414](https://github.com/nfs-ganesha/ntirpc/pull/414)
 which validates decoded RPC reply verifiers inside ntirpc. The bindings no
 longer replace transport callbacks or depend on a copied private layout.
 
-Two local source patches are documented in [vendor/UPSTREAM.md](vendor/UPSTREAM.md):
+The build and GSS allocation patches are documented in [vendor/UPSTREAM.md](vendor/UPSTREAM.md):
 static archive construction and zero-initialized GSS credential allocation.
 The latter replaces our process-global allocator hook; PR #414 does not fix
 that separate initialization defect. Upstream license notices are preserved.
@@ -103,3 +103,14 @@ or an explicit Cargo path override during coordinated development. Run
 The vNFS RPCSEC_GSS integration suite exercises the source-built client against
 a separate NFS server and KDC. Packaging and offline builds must also pass
 before a new source pin is released.
+
+
+Additional native correctness patches are listed in
+[vendor/PATCHES.md](vendor/PATCHES.md). Run the example and native regression
+checks as well:
+
+```sh
+cargo test --examples --all-features
+bash tests/check-native-xdr.sh
+bash tests/check-bindgen-env.sh
+```
