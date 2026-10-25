@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
 - Backport reviewed upstream transport lock/reference, epoll teardown,
   broadcast cleanup, and RPCSEC_GSS deadlock/leak fixes. Record source commits,
