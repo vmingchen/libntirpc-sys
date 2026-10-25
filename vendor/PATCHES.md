@@ -37,3 +37,4 @@ authorship remain with the original commits.
 | PR | Reviewed commit(s) | Applied change and assessment |
 | --- | --- | --- |
 | [#418](https://github.com/nfs-ganesha/ntirpc/pull/418) | `4cb5ec589390226d1ad79225616a1e60d5280160` | Applied in full. Channel destruction owns the events allocation and epoll descriptor, including setup failures. Removes the loop's stale descriptor close and duplicate cleanup. Also frees worker state when `pthread_create` fails (part of this commit, although omitted from its PR description). |
+| [#420](https://github.com/nfs-ganesha/ntirpc/pull/420) | `116bd46c7e6cffb966ad1b6d624648fd1578904b` | Applied in full. The epoll-only union access belongs inside its preprocessor guard. |
