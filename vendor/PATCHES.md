@@ -3,6 +3,19 @@
 These changes apply to the bundled NTIRPC source and its installed headers.
 Keep the behavioral regression tests when refreshing the upstream source.
 
+- `src/clnt_generic.c`: pin synchronous requests before releasing the reply
+  lookup lock, serialize decoding with their waiter, and drain queued replies
+  before request state and callback arguments can be freed. Completed replies
+  take precedence over an expired wait deadline. Covered by slow-decode,
+  queued-cancellation, timeout, and failure cases in `tests/native_sync_reply.c`.
+
+- `src/clnt_simple.c`, `src/rpc_generic.c`, `src/getnetconfig.c`, and
+  `src/auth_none.c`: use `pthread_once` to publish RPC/transport/netconfig
+  thread keys and the AUTH_NONE singleton without unsynchronized first-use
+  reads. Key creation failures prevent use of an invalid key. Covered by
+  simultaneous first-use checks in `tests/native_client_init.c`; safe client
+  calls can run concurrently without a wrapper-wide lock.
+
 - `src/clnt_bcast.c`: copy only `sizeof(struct sockaddr_in)` from IPv4
   broadcast addresses instead of reading a full `sockaddr_storage`. Zero the
   destination storage so IPv6 flowinfo and unused address bytes are initialized.

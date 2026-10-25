@@ -15,30 +15,25 @@ Its implementation is adapted from the
 ## Examples
 
 The [examples](examples/) directory contains a small "hello world" RPC
-client-server pair built directly on the raw bindings. The client issues a
-single synchronous call:
+client-server pair. The client uses a safe synchronous string RPC wrapper:
 
 ```rust
-use libntirpc_sys::*;
-
-// Send `name`, receive the greeting (`wrap_string` adapts `xdr_wrapstring`
-// to the generic `xdrproc_t` signature; see examples/hello_client.rs).
-// SAFETY: ntirpc is initialized, host is a live C string, and the two arguments
-// point to string-pointer slots matching wrap_string. Input storage is readable
-// and NUL-terminated; the null result receives an owned decoded allocation.
-// All storage remains live until the synchronous call returns.
-let stat = unsafe {
-    rpc_call(
-        host.as_ptr(), HELLO_PROG, HELLO_VERS, HELLO_PROC,
-        Some(wrap_string),                       // encode the argument
-        &mut name as *mut _ as *const c_void,
-        Some(wrap_string),                       // decode the result
-        &mut greeting as *mut _ as *mut c_void,
-        c"udp".as_ptr(),                         // transport
-    )
-};
-assert!(stat == clnt_stat_RPC_SUCCESS);
+let reply = libntirpc_sys::client::call_string(
+    c"127.0.0.1", 0x3000_0001, 1, 1, c"Alice", c"udp",
+)?;
+println!("{}", reply.as_c_str().to_string_lossy());
 ```
+
+`client::call_string` initializes a client runtime once, borrows its input, and
+returns an owned `XdrString` that frees the result on drop. It also cleans up
+results on RPC errors. This focused API supports string arguments/results,
+AUTH_NONE, and ntirpc's default timeout/retries. Independent calls can run
+concurrently after one-time initialization. The runtime remains live for the
+process lifetime. An active reply decoder finishes before a call returns, even
+when it runs past the nominal timeout.
+Use raw bindings for custom server/runtime initialization, authentication, or
+other wire types. Raw FFI code must preserve the managed runtime and allocator
+invariants when sharing a process with this wrapper.
 
 The pair needs the `rpcbind` daemon, which is used to register the server's
 program number and for the client to look it up:

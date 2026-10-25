@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add a safe synchronous string RPC client with managed initialization and
+  result ownership; remove unsafe code from the hello client and README example.
+- Keep synchronous RPC request state alive until active and queued reply
+  callbacks finish, including across retries, errors, and timeouts.
+
 - Fix an IPv4 broadcast address overread and initialize broadcast address
   storage, with native IPv4/IPv6 regression coverage.
 - Select stable Rust explicitly in the main CI job.

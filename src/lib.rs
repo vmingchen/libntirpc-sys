@@ -17,6 +17,7 @@ pub use bindings::*;
 #[allow(non_camel_case_types)]
 pub type rpcblist = rp__list;
 
+pub mod client;
 pub mod xdr;
 
 #[cfg(feature = "fuzzing")]

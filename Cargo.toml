@@ -78,3 +78,8 @@ harness = false
 cc = "1"
 bindgen = { version = "=0.73.2", default-features = false, features = ["runtime"] }
 pkg-config = "0.3"
+
+[[bench]]
+name = "rpc_string_overhead"
+path = "benches/rpc_string_overhead.rs"
+harness = false

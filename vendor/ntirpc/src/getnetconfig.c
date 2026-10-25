@@ -127,28 +127,26 @@ static struct netconfig_info ni = { 0, 0, NULL, NULL };
 
 #define MAXNETCONFIGLINE    1000
 
+extern thread_key_t nc_key;
+static pthread_once_t nc_once = PTHREAD_ONCE_INIT;
+static int nc_key_error;
+
+static void
+nc_init_key(void)
+{
+	nc_key_error = thr_keycreate(&nc_key, thr_keyfree);
+}
+
 static int *
 __nc_error(void)
 {
-	static pthread_mutex_t nc_lock = MUTEX_INITIALIZER;
-	extern thread_key_t nc_key;
 	static int nc_error;
-	int error, *nc_addr;
+	int *nc_addr;
 
-	/*
-	 * Use the static `nc_error' if we are the main thread
-	 * (including non-threaded programs), or if an allocation
-	 * fails.
-	 */
-	if (nc_key == -1) {
-		error = 0;
-		mutex_lock(&nc_lock);
-		if (nc_key == -1)
-			error = thr_keycreate(&nc_key, thr_keyfree);
-		mutex_unlock(&nc_lock);
-		if (error)
-			return (&nc_error);
-	}
+	pthread_once(&nc_once, nc_init_key);
+	if (nc_key_error)
+		return (&nc_error);
+
 	nc_addr = (int *)thr_getspecific(nc_key);
 	if (nc_addr == NULL) {
 		nc_addr = (int *)mem_zalloc(sizeof(int));

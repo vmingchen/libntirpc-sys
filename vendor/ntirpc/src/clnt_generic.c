@@ -495,9 +495,24 @@ rdma_clnt_req_expire_insert(struct clnt_req *cc)
 	rpc_dplx_rui(rec);
 }
 
+void clnt_req_callback_default(struct clnt_req *);
+
+/* Private completion state; no change to the public request layout. */
+#define CLNT_REQ_FLAG_SYNC_DONE 0x0010
+
+/* Both the synchronous waiter and reply decoder hold cc_we.mtx. */
+static void
+clnt_req_callback_sync(struct clnt_req *cc)
+{
+	cond_signal(&cc->cc_we.cv);
+}
+
 enum clnt_stat
 clnt_req_callback(struct clnt_req *cc)
 {
+	/* Asynchronous callbacks retain their original locking contract. */
+	if (cc->cc_process_cb == clnt_req_callback_sync)
+		cc->cc_process_cb = clnt_req_callback_default;
 	/* Add to appropriate call_expires list based on transport type */
 	if (cc->cc_clnt->rdma_clnt) {
 		rdma_clnt_req_expire_insert(cc);
@@ -602,7 +617,7 @@ clnt_req_setup(struct clnt_req *cc, struct timespec timeout)
 	cc->cc_error.re_errno = 0;
 	cc->cc_error.re_status = RPC_SUCCESS;
 	cc->cc_flags = CLNT_REQ_FLAG_NONE;
-	cc->cc_process_cb = clnt_req_callback_default;
+	cc->cc_process_cb = clnt_req_callback_sync;
 	cc->cc_refreshes = 2;
 	cc->cc_timeout = timeout;
 
@@ -650,10 +665,20 @@ clnt_req_process_reply(SVCXPRT *xprt, struct svc_req *req)
 	struct opr_rbtree_node *nv;
 	struct clnt_req *cc;
 	struct clnt_req cc_k;
+	bool synchronous = false;
 
 	rpc_dplx_rli(rec);
 	cc_k.cc_xid = req->rq_msg.rm_xid;
 	nv = opr_rbtree_lookup(&rec->call_replies, &cc_k.cc_dplx);
+	if (nv) {
+		cc = opr_containerof(nv, struct clnt_req, cc_dplx);
+		synchronous = cc->cc_process_cb == clnt_req_callback_sync;
+		/* Pin before dropping the lookup lock. A synchronous waiter
+		 * removes its mapping and drains these pins before returning.
+		 */
+		if (synchronous)
+			atomic_inc_int32_t(&cc->cc_refcnt);
+	}
 	rpc_dplx_rui(rec);
 	if (!nv) {
 		__warnx(TIRPC_DEBUG_FLAG_ERROR,
@@ -661,7 +686,15 @@ clnt_req_process_reply(SVCXPRT *xprt, struct svc_req *req)
 			__func__, &rec->xprt, rec->xprt.xp_fd, cc_k.cc_xid);
 		return SVC_STAT(xprt);
 	}
-	cc = opr_containerof(nv, struct clnt_req, cc_dplx);
+	if (synchronous) {
+		/* Never acquire cc_we.mtx while holding the transport lock:
+		 * reset/refresh take those locks in the opposite order.
+		 */
+		mutex_lock(&cc->cc_we.mtx);
+		if (atomic_fetch_uint16_t(&cc->cc_flags)
+		    & CLNT_REQ_FLAG_SYNC_DONE)
+			goto finished;
+	}
 
 	/* order dependent */
 	if (atomic_postclear_uint16_t_bits(&cc->cc_flags,
@@ -682,7 +715,7 @@ clnt_req_process_reply(SVCXPRT *xprt, struct svc_req *req)
 			__func__, xprt, xprt->xp_fd, cc->cc_xid,
 			cc->cc_error.re_status);
 		cc->cc_refreshes = 0;
-		return SVC_STAT(xprt);
+		goto finished;
 	}
 
 	_seterr_reply(&req->rq_msg, &(cc->cc_error));
@@ -710,7 +743,27 @@ clnt_req_process_reply(SVCXPRT *xprt, struct svc_req *req)
 		cc->cc_error.re_status);
 
 	(*cc->cc_process_cb)(cc);
+ finished:
+	if (synchronous) {
+		/* The waiter retains its original reference until every lookup
+		 * pin is gone, so this cannot be the final release.
+		 */
+		atomic_dec_int32_t(&cc->cc_refcnt);
+		cond_broadcast(&cc->cc_we.cv);
+		mutex_unlock(&cc->cc_we.mtx);
+	}
 	return SVC_STAT(xprt);
+}
+
+/* Called with cc_we.mtx held, including error and zero-timeout exits. */
+static enum clnt_stat
+clnt_req_finish_sync(struct clnt_req *cc, enum clnt_stat status)
+{
+	atomic_set_uint16_t_bits(&cc->cc_flags, CLNT_REQ_FLAG_SYNC_DONE);
+	clnt_req_reset(cc); /* Exclude new lookups before draining existing ones. */
+	while (atomic_fetch_int32_t(&cc->cc_refcnt) > 1)
+		cond_wait(&cc->cc_we.cv, &cc->cc_we.mtx);
+	return status;
 }
 
 enum clnt_stat
@@ -729,16 +782,27 @@ clnt_req_wait_reply(struct clnt_req *cc)
  call_again:
 	cc->cc_error.re_status = CLNT_CALL_ONCE(cc);
 	if (cc->cc_error.re_status != RPC_SUCCESS) {
-		return (cc->cc_error.re_status);
+		return clnt_req_finish_sync(cc, cc->cc_error.re_status);
 	}
 
 	if (!(cc->cc_timeout.tv_sec + cc->cc_timeout.tv_nsec)) {
-		return (RPC_SUCCESS);
+		return clnt_req_finish_sync(cc, RPC_SUCCESS);
 	}
 
 	(void)clock_gettime(CLOCK_REALTIME_FAST, &ts);
 	timespecadd(&ts, &cc->cc_timeout, &ts);
-	code = cond_timedwait(&cc->cc_we.cv, &cc->cc_we.mtx, &ts);
+	/* A condition variable may wake spuriously. The decoder publishes ACK
+	 * while holding this mutex and finishes before the waiter reacquires it.
+	 */
+	code = 0;
+	while (!(atomic_fetch_uint16_t(&cc->cc_flags) & CLNT_REQ_FLAG_ACKSYNC)
+	    && code == 0)
+		code = cond_timedwait(&cc->cc_we.cv, &cc->cc_we.mtx, &ts);
+	/* The deadline may pass while a decoder holds the mutex. Its completed
+	 * reply wins over the wait's timeout once we reacquire the mutex.
+	 */
+	if (atomic_fetch_uint16_t(&cc->cc_flags) & CLNT_REQ_FLAG_ACKSYNC)
+		code = 0;
 
 	__warnx(TIRPC_DEBUG_FLAG_CLNT_REQ,
 		"%s: %p fd %d replied xid %" PRIu32,
@@ -750,17 +814,17 @@ clnt_req_wait_reply(struct clnt_req *cc)
 			/* XXX should also set error.re_why, but the
 			 * facility is not well developed. */
 			cc->cc_error.re_status = RPC_TIMEDOUT;
-			return (RPC_TIMEDOUT);
+			return clnt_req_finish_sync(cc, RPC_TIMEDOUT);
 		}
 	}
 
 	if (cc->cc_refreshes-- > 0) {
 		if (cc->cc_error.re_status == RPC_AUTHERROR) {
 			if (!AUTH_REFRESH(cc->cc_auth, NULL)) {
-				return (RPC_AUTHERROR);
+				return clnt_req_finish_sync(cc, RPC_AUTHERROR);
 			}
 			if (clnt_req_refresh(cc) != RPC_SUCCESS) {
-				return (cc->cc_error.re_status);
+				return clnt_req_finish_sync(cc, cc->cc_error.re_status);
 			}
 		}
 		atomic_clear_uint16_t_bits(&cc->cc_flags,
@@ -773,14 +837,14 @@ clnt_req_wait_reply(struct clnt_req *cc)
 			"%s: %p fd %d ETIMEDOUT",
 			__func__, &rec->xprt, rec->xprt.xp_fd);
 		cc->cc_error.re_status = RPC_TIMEDOUT;
-		return (RPC_TIMEDOUT);
+		return clnt_req_finish_sync(cc, RPC_TIMEDOUT);
 	}
 
 	__warnx(TIRPC_DEBUG_FLAG_CLNT_DG,
 		"%s: %p fd %d result=%d",
 		__func__, &rec->xprt, rec->xprt.xp_fd, cc->cc_error.re_status);
 
-	return (cc->cc_error.re_status);
+	return clnt_req_finish_sync(cc, cc->cc_error.re_status);
 }
 
 int

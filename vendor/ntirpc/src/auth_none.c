@@ -80,35 +80,30 @@ struct andata {
 static struct andata auth_none_priv;
 static struct andata *ap;
 
-static pthread_mutex_t init_lock = MUTEX_INITIALIZER;
+static pthread_once_t authnone_once = PTHREAD_ONCE_INIT;
+
+static void
+authnone_init(void)
+{
+	XDR xdrs[1];
+
+	ap = &auth_none_priv;
+	ap->no_client.ah_cred = ap->no_client.ah_verf = _null_auth;
+	ap->no_client.ah_ops = authnone_ops();
+	ap->no_client.ah_private = NULL;
+	ap->no_client.ah_error.re_status = RPC_SUCCESS;
+	xdrmem_create(xdrs, ap->marshalled_client,
+		      (u_int) MAX_MARSHAL_SIZE, XDR_ENCODE);
+	(void)xdr_opaque_auth_encode(xdrs, &ap->no_client.ah_cred);
+	(void)xdr_opaque_auth_encode(xdrs, &ap->no_client.ah_verf);
+	ap->mcnt = XDR_GETPOS(xdrs);
+	XDR_DESTROY(xdrs);
+}
 
 AUTH *
 authnone_ncreate(void)
 {
-	XDR xdrs[1];
-
-	if (!ap) {
-		mutex_lock(&init_lock);
-		if (!ap) {
-			ap = &auth_none_priv; /* shared */
-			ap->no_client.ah_cred =
-			ap->no_client.ah_verf = _null_auth;
-			ap->no_client.ah_ops = authnone_ops();
-			ap->no_client.ah_private = NULL;
-			ap->no_client.ah_error.re_status = RPC_SUCCESS;
-
-			xdrmem_create(xdrs, ap->marshalled_client,
-				      (u_int) MAX_MARSHAL_SIZE, XDR_ENCODE);
-			(void)xdr_opaque_auth_encode(xdrs,
-						     &ap->no_client.ah_cred);
-			(void)xdr_opaque_auth_encode(xdrs,
-						     &ap->no_client.ah_verf);
-			ap->mcnt = XDR_GETPOS(xdrs);
-			XDR_DESTROY(xdrs);
-		}
-		mutex_unlock(&init_lock);
-	}
-
+	pthread_once(&authnone_once, authnone_init);
 	return (&ap->no_client);
 }
 

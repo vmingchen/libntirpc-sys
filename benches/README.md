@@ -33,3 +33,20 @@ each string once per round trip, rather than summing both encode/decode traffic.
 Timings depend on the machine, allocator, compiler, and concurrent workload.
 Only the allocation invariants are CI gates; throughput is reported without a
 machine-specific performance threshold.
+
+## Safe RPC boundary overhead
+
+```sh
+bash tests/bench-rpc-string.sh
+```
+
+This isolated benchmark uses GNU ld `--wrap` to replace `svc_init` and
+`rpc_call` only in the benchmark executable. It starts no worker threads and
+performs no network I/O. Both paths run real ntirpc string encoding, decoding,
+and cleanup; the raw path uses string-pointer callbacks and the safe path uses
+`client::call_string`. Runtime initialization is warmed up before measurement.
+Both paths must perform zero Rust allocations and exactly one native decoded
+string allocation per call. Input is borrowed and no staging copy is made.
+Timings include allocator counters and are diagnostic, not network throughput
+measurements or CI timing thresholds. The normal benchmark command skips this
+fixture unless the helper script enables its linker wrapping.

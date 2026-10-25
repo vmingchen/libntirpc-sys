@@ -80,6 +80,16 @@ static void rpc_call_destroy(void *vp)
 	}
 }
 
+extern thread_key_t rpc_call_key;
+static pthread_once_t rpc_call_once = PTHREAD_ONCE_INIT;
+static int rpc_call_key_error;
+
+static void
+rpc_call_init_key(void)
+{
+	rpc_call_key_error = thr_keycreate(&rpc_call_key, rpc_call_destroy);
+}
+
 static const struct timespec to = { 3, 0 };
 
 /*
@@ -103,15 +113,10 @@ rpc_call(const char *host,	/* host name */
 	struct rpc_call_private *rcp;
 	struct clnt_req *cc;
 	enum clnt_stat clnt_stat;
-	extern thread_key_t rpc_call_key;
-	extern mutex_t tsd_lock;
 
-	if (rpc_call_key == -1) {
-		mutex_lock(&tsd_lock);
-		if (rpc_call_key == -1)
-			thr_keycreate(&rpc_call_key, rpc_call_destroy);
-		mutex_unlock(&tsd_lock);
-	}
+	pthread_once(&rpc_call_once, rpc_call_init_key);
+	if (rpc_call_key_error)
+		return RPC_SYSTEMERROR;
 	rcp = (struct rpc_call_private *)thr_getspecific(rpc_call_key);
 	if (rcp == NULL) {
 		rcp = mem_alloc(sizeof(*rcp));
