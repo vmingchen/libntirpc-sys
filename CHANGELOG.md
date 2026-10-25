@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.4
 
 - Add reusable `client::Client` configuration and a safe `RpcCodec` trait, with
   the built-in `WrapString<N>` codec and borrowed network/memory XDR stream views.

@@ -2,7 +2,7 @@
 # VFSI consumes published releases or an explicit local Cargo path override.
 [package]
 name = "libntirpc-sys"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Ming Chen <v.mingchen@gmail.com>"]

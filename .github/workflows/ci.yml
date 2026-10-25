@@ -30,7 +30,7 @@ jobs:
       - name: Verify packaged native source
         run: cargo package --locked
       - name: Test the exact packaged source offline
-        run: cargo test --offline --manifest-path target/package/libntirpc-sys-0.3.3/Cargo.toml --all-features
+        run: cargo test --offline --manifest-path target/package/libntirpc-sys-0.3.4/Cargo.toml --all-features
       - name: Verify docs.rs declarations
         run: DOCS_RS=1 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
       - name: Verify docs mode does not contaminate native builds
