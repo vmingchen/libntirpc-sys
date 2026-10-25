@@ -433,6 +433,9 @@ svcauth_gss_accept_sec_context(struct svc_req *req,
 			__warnx(TIRPC_DEBUG_FLAG_AUTH,
 				"%s: display_name major=%u minor=%u", __func__,
 				maj_stat, min_stat);
+			mem_free(gr->gr_ctx.value, 0);
+			gr->gr_ctx.value = NULL;
+			gr->gr_ctx.length = 0;
 			gss_release_buffer(&min_stat, &gr->gr_token);
 			return (false);
 		}
@@ -467,12 +470,18 @@ svcauth_gss_accept_sec_context(struct svc_req *req,
 				&checksum);
 
 		if (maj_stat != GSS_S_COMPLETE) {
+			mem_free(gr->gr_ctx.value, 0);
+			gr->gr_ctx.value = NULL;
+			gr->gr_ctx.length = 0;
 			gss_release_buffer(&min_stat, &gr->gr_token);
 			return (false);
 		}
 
 		/* XXX ref? (assert gd->locked?) */
 		if (checksum.length > MAX_AUTH_BYTES){
+			mem_free(gr->gr_ctx.value, 0);
+			gr->gr_ctx.value = NULL;
+			gr->gr_ctx.length = 0;
 			gss_release_buffer(&min_stat, &gr->gr_token);
 			gss_release_buffer(&min_stat, &checksum);
 			return (false);
@@ -856,8 +865,12 @@ _svcauth_gss(struct svc_req *req, bool *no_dispatch)
 
 		if (!res) {
 			rc = AUTH_FAILED;
-			(void)authgss_ctx_hash_del(gd);
-			goto gd_free;
+			mutex_unlock(&gd->lock);
+			if (gr.gr_major == GSS_S_COMPLETE)
+				(void)authgss_ctx_hash_del(gd);
+			unref_svc_rpc_gss_data(gd);
+			req->rq_auth = NULL;
+			goto cred_free;
 		}
 
 		if (gr.gr_major == GSS_S_COMPLETE) {
