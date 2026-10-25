@@ -35,6 +35,21 @@ int main(void)
 	close(pair[0]);
 	close(pair[1]);
 
+	/* Failed creates retain tree state but must drop each caller reference. */
+	assert(pipe(pair) == 0);
+	for (int i = 0; i < 10; ++i)
+		assert(svc_dg_ncreatef(pair[0], 0, 0, SVC_CREATE_FLAG_XPRT_NOREG) == NULL);
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(fd >= 0);
+	assert(dup2(fd, pair[0]) == pair[0]);
+	close(fd);
+	x = svc_dg_ncreatef(pair[0], 0, 0, SVC_CREATE_FLAG_XPRT_NOREG);
+	assert(x != NULL);
+	assert(x->xp_refcnt == 3); /* setup, tree and caller; no failed callers */
+	SVC_DESTROY(x);
+	SVC_RELEASE(x, SVC_RELEASE_FLAG_NONE);
+	close(pair[0]);
+	close(pair[1]);
 	assert(svc_shutdown(SVC_SHUTDOWN_FLAG_NONE) == 0);
 	return 0;
 }
