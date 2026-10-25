@@ -1,11 +1,11 @@
 # Sanitized XDR fuzzing
 
-Install the normal native build dependencies plus clang, ripgrep and nm/binutils,
-then install the fuzz tools:
+Install the normal native build dependencies plus Python 3, clang, ripgrep, and
+nm/binutils, then install the fuzz tools:
 
 ```sh
 rustup toolchain install nightly --component rust-src
-cargo install cargo-fuzz --version 0.13.1 --locked
+cargo install cargo-fuzz --version 0.13.2 --locked
 bash tests/fuzz-xdr.sh 30
 ```
 
