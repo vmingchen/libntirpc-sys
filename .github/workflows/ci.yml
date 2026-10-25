@@ -21,6 +21,8 @@ jobs:
       - run: cargo test --examples --all-features
       - name: Verify reusable XDR allocation counts
         run: cargo bench --bench xdr_allocations
+      - name: Verify typed RPC allocation counts and callback boundary
+        run: bash tests/bench-rpc-string.sh
       - name: Check quoted bindgen arguments
         run: bash tests/check-bindgen-env.sh
       - name: Check native inline XDR regressions

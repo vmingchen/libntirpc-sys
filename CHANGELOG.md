@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add reusable `client::Client` configuration and a safe `RpcCodec` trait, with
+  the built-in `WrapString<N>` codec and borrowed network/memory XDR stream views.
+  Encode directly without extra buffers or input copies; contain codec panics
+  at the C boundary and reject nested RPC calls from codecs.
 - Add a safe synchronous string RPC client with managed initialization and
   result ownership; remove unsafe code from the hello client and README example.
 - Keep synchronous RPC request state alive until active and queued reply

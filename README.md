@@ -15,25 +15,61 @@ Its implementation is adapted from the
 ## Examples
 
 The [examples](examples/) directory contains a small "hello world" RPC
-client-server pair. The client uses a safe synchronous string RPC wrapper:
+client-server pair. A safe `Client` stores the endpoint once; a typed `RpcCodec`
+defines each procedure's number, request encoding, and reply decoding:
 
 ```rust
-let reply = libntirpc_sys::client::call_string(
-    c"127.0.0.1", 0x3000_0001, 1, 1, c"Alice", c"udp",
-)?;
+use std::ffi::CStr;
+use libntirpc_sys::{client::{Client, RpcCodec}, rpcproc_t};
+use libntirpc_sys::xdr::{self, XdrDecoder, XdrEncoder, XdrString};
+
+struct Hello;
+
+impl RpcCodec for Hello {
+    const NUMBER: rpcproc_t = 1;
+    type Request = CStr;
+    type Reply = XdrString;
+
+    fn encode(xdr: &mut XdrEncoder<'_>, name: &CStr) -> Result<(), xdr::Error> {
+        xdr.encode_string(name)
+    }
+
+    fn decode(xdr: &mut XdrDecoder<'_>) -> Result<XdrString, xdr::Error> {
+        xdr.decode_string()
+    }
+}
+
+let client = Client::new(c"127.0.0.1", 0x3000_0001, 1, c"udp")?;
+let reply = client.call::<Hello>(c"Alice")?;
 println!("{}", reply.as_c_str().to_string_lossy());
+let another_reply = client.call::<Hello>(c"Bob")?;
 ```
 
-`client::call_string` initializes a client runtime once, borrows its input, and
-returns an owned `XdrString` that frees the result on drop. It also cleans up
-results on RPC errors. This focused API supports string arguments/results,
-AUTH_NONE, and ntirpc's default timeout/retries. Independent calls can run
-concurrently after one-time initialization. The runtime remains live for the
-process lifetime. An active reply decoder finishes before a call returns, even
-when it runs past the nominal timeout.
-Use raw bindings for custom server/runtime initialization, authentication, or
-other wire types. Raw FFI code must preserve the managed runtime and allocator
-invariants when sharing a process with this wrapper.
+For string-to-string procedures, the supplied `WrapString<N>` codec avoids
+writing an implementation: `client.call::<libntirpc_sys::client::WrapString<1>>(c"Alice")`.
+The existing `client::call_string` function remains available.
+
+Construction copies the host and transport names once and initializes the client
+runtime. Connections are established lazily and cached per thread by ntirpc.
+Calls borrow requests and encode/decode directly over network XDR streams,
+without additional buffers or input copies. The safe stream views provide
+`encode_string`/`decode_string` and `encode_u32`/`decode_u32`; codecs can combine
+these into structured requests and replies. `XdrString` owns its native allocation
+and frees it on drop, including when an RPC fails after decoding a result.
+
+Requests must be `Sync` and replies `Send`, because codecs may run on worker
+threads. Codec panics are caught before crossing C and resumed on the calling
+thread after callbacks finish. Nested managed RPCs on a codec's thread return
+`Error::ReentrantCall`. Codecs may run more than once on retries.
+
+The client uses AUTH_NONE and ntirpc's default timeout/retries. Independent calls
+can run concurrently, including through a shared `Client`. Dropping a client
+does not close ntirpc's per-thread cached connections or stop the process-lifetime
+runtime. An active reply decoder finishes before a call returns, even when it
+runs past the nominal timeout. Use raw bindings for custom runtime/server
+initialization, authentication, or wire operations beyond the safe stream API.
+Raw FFI code must preserve the managed runtime and allocator invariants when
+sharing a process with this wrapper.
 
 The pair needs the `rpcbind` daemon, which is used to register the server's
 program number and for the client to look it up:
@@ -92,7 +128,9 @@ storage and allocates only when its capacity must grow. Decoded strings remain
 valid across resets, refills, and destruction of their decoder. The fuzz adapter
 copies each input once and rewinds that decoder for all three decoding passes.
 
-Network callbacks still require an unsafe boundary: `XdrString::decode_from_raw`
+Managed RPC codecs receive safe `XdrEncoder`/`XdrDecoder` views. They can also
+be tested using `encoder.encoder()` and `decoder.decoder()` on memory streams.
+Custom raw network callbacks still require an unsafe boundary: `XdrString::decode_from_raw`
 requires a valid, exclusively accessed XDR stream with live backing storage and
 correct callbacks. `XdrString::from_raw` requires unique ownership of a valid
 ntirpc allocation. An arbitrary `*mut XDR` or `char **` cannot prove these

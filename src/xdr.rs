@@ -1,9 +1,10 @@
-//! Safe memory-backed XDR string encoding and decoding.
+//! Safe XDR encoding, decoding, and string ownership.
 //!
 //! Stream modes, aligned buffers, stable stream addresses, and decoded-string
-//! ownership are private invariants. Network streams can use
-//! [`XdrString::decode_from_raw`], but establishing a raw stream's validity still
-//! requires an unsafe call. Strings have C string semantics, not guaranteed UTF-8.
+//! ownership are private invariants. Managed RPC codecs receive borrowed
+//! [`XdrEncoder`]/[`XdrDecoder`] views over network streams. Custom raw callbacks
+//! can use [`XdrString::decode_from_raw`], with an unsafe stream-validity contract.
+//! Strings have C string semantics, not guaranteed UTF-8.
 //!
 //! ```
 //! use libntirpc_sys::xdr::{MemoryDecoder, MemoryEncoder};
@@ -18,6 +19,7 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char};
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use crate::{XDR, xdr_op, xdr_op_XDR_DECODE, xdr_op_XDR_ENCODE, xdr_op_XDR_FREE};
@@ -27,7 +29,7 @@ use crate::{XDR, xdr_op, xdr_op_XDR_DECODE, xdr_op_XDR_ENCODE, xdr_op_XDR_FREE};
 pub enum Error {
     /// The byte length does not fit ntirpc's 32-bit stream length.
     LengthOverflow,
-    /// A borrowed raw stream was not in decode mode.
+    /// A borrowed raw stream was not in the required encode/decode mode.
     WrongMode,
     /// Malformed/truncated input, an oversized string, or insufficient output space.
     OperationFailed,
@@ -37,13 +39,112 @@ impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::LengthOverflow => "XDR memory stream length exceeds u32::MAX",
-            Self::WrongMode => "XDR string decoder requires a decode stream",
-            Self::OperationFailed => "XDR string operation failed",
+            Self::WrongMode => "XDR stream has the wrong operation mode",
+            Self::OperationFailed => "XDR operation failed",
         })
     }
 }
 
 impl std::error::Error for Error {}
+
+/// An exclusively borrowed XDR stream fixed in encode mode.
+///
+/// RPC callbacks receive this view directly over ntirpc's stream, without an
+/// intermediate buffer. Memory streams expose it through [`MemoryEncoder::encoder`].
+/// Safe methods neither expose raw pointers nor transfer ownership of input.
+pub struct XdrEncoder<'a> {
+    stream: NonNull<XDR>,
+    borrow: PhantomData<&'a mut XDR>,
+}
+
+impl<'a> XdrEncoder<'a> {
+    /// # Safety
+    /// stream must be a live initialized ntirpc XDR with valid callbacks and
+    /// backing storage. It must remain exclusively borrowed for 'a, including
+    /// its operation table and mode. Allocator hooks must remain valid.
+    pub(crate) unsafe fn from_raw(stream: *mut XDR) -> Result<Self, Error> {
+        // SAFETY: The caller guarantees a live initialized descriptor.
+        if unsafe { (*stream).x_op } != xdr_op_XDR_ENCODE {
+            return Err(Error::WrongMode);
+        }
+        Ok(Self {
+            stream: NonNull::new(stream).expect("live XDR stream"),
+            borrow: PhantomData,
+        })
+    }
+
+    /// Encode a borrowed C string using `xdr_wrapstring` (at most 9000 bytes).
+    pub fn encode_string(&mut self, string: &CStr) -> Result<(), Error> {
+        let mut pointer = string.as_ptr().cast_mut();
+        // SAFETY: Construction fixes a live, exclusively borrowed stream in
+        // ENCODE mode. ntirpc only reads the terminated input and retains neither
+        // the string nor this local pointer slot; no ownership transfers.
+        if unsafe { crate::xdr_wrapstring(self.stream.as_ptr(), &mut pointer) } {
+            Ok(())
+        } else {
+            Err(Error::OperationFailed)
+        }
+    }
+
+    /// Encode an unsigned 32-bit integer in XDR network byte order.
+    pub fn encode_u32(&mut self, mut value: u32) -> Result<(), Error> {
+        // SAFETY: The live exclusive stream is in ENCODE mode, and value is an
+        // initialized u32 matching unsigned int on the supported Linux ABI.
+        if unsafe { crate::xdr_u_int(self.stream.as_ptr(), &mut value) } {
+            Ok(())
+        } else {
+            Err(Error::OperationFailed)
+        }
+    }
+}
+
+/// An exclusively borrowed XDR stream fixed in decode mode.
+///
+/// RPC callbacks receive this view directly over ntirpc's stream. Memory streams
+/// expose it through [`MemoryDecoder::decoder`]. Results own their storage and
+/// can outlive this view. Failed operations may advance the stream cursor.
+pub struct XdrDecoder<'a> {
+    stream: NonNull<XDR>,
+    borrow: PhantomData<&'a mut XDR>,
+}
+
+impl<'a> XdrDecoder<'a> {
+    /// # Safety
+    /// stream must be a live initialized ntirpc XDR with valid callbacks and
+    /// backing storage. It must remain exclusively borrowed for 'a, including
+    /// its operation table and mode. Allocator hooks must remain valid, including
+    /// until any decoded strings are dropped.
+    pub(crate) unsafe fn from_raw(stream: *mut XDR) -> Result<Self, Error> {
+        // SAFETY: The caller guarantees a live initialized descriptor.
+        if unsafe { (*stream).x_op } != xdr_op_XDR_DECODE {
+            return Err(Error::WrongMode);
+        }
+        Ok(Self {
+            stream: NonNull::new(stream).expect("live XDR stream"),
+            borrow: PhantomData,
+        })
+    }
+
+    /// Decode a new owned C string using `xdr_wrapstring` (at most 9000 bytes).
+    /// Storage allocated before a failed decode is released automatically.
+    pub fn decode_string(&mut self) -> Result<XdrString, Error> {
+        // SAFETY: Construction establishes a valid exclusive decode stream;
+        // decode_from_raw allocates fresh owned output and cleans up failure.
+        unsafe { XdrString::decode_from_raw(self.stream.as_ptr()) }
+    }
+
+    /// Decode an unsigned 32-bit integer from XDR network byte order.
+    pub fn decode_u32(&mut self) -> Result<u32, Error> {
+        let mut value = 0;
+        // SAFETY: The live exclusive stream is in DECODE mode, and value is a
+        // writable u32 matching unsigned int on the supported Linux ABI.
+        if unsafe { crate::xdr_u_int(self.stream.as_ptr(), &mut value) } {
+            Ok(value)
+        } else {
+            Err(Error::OperationFailed)
+        }
+    }
+}
 
 fn zeroed_stream() -> XDR {
     // SAFETY: XDR contains C integers, raw pointers and nullable callbacks, all
@@ -145,9 +246,23 @@ impl MemoryDecoder {
     /// This never reuses caller storage, so a peer cannot overrun a supplied
     /// string buffer. ntirpc applies `xdr_wrapstring`'s protocol length limit.
     pub fn decode_string(&mut self) -> Result<XdrString, Error> {
+        self.decoder().decode_string()
+    }
+
+    /// Borrow this memory stream for the same safe operations used by RPC codecs.
+    /// The view excludes other operations on the owner until its last use:
+    ///
+    /// ```compile_fail
+    /// use libntirpc_sys::xdr::MemoryDecoder;
+    /// let mut memory = MemoryDecoder::new(&[0; 4]).unwrap();
+    /// let mut view = memory.decoder();
+    /// memory.refill(&[0; 4]).unwrap();
+    /// view.decode_u32().unwrap();
+    /// ```
+    pub fn decoder(&mut self) -> XdrDecoder<'_> {
         // SAFETY: The private memory stream is initialized for decoding, owns
-        // its stable backing allocations, and is exclusively borrowed here.
-        unsafe { XdrString::decode_from_raw(self.0.as_raw()) }
+        // its stable backing allocations, and is exclusively borrowed for the view.
+        unsafe { XdrDecoder::from_raw(self.0.as_raw()) }.expect("private decode stream")
     }
 
     /// Restart decoding the current input without allocating or copying it.
@@ -208,15 +323,23 @@ impl MemoryEncoder {
 
     /// Encode a borrowed NUL-terminated string using `xdr_wrapstring`.
     pub fn encode_string(&mut self, string: &CStr) -> Result<(), Error> {
-        let mut pointer = string.as_ptr().cast_mut();
-        // SAFETY: The private stream is live, exclusively borrowed and fixed
-        // in encode mode. C only reads this NUL-terminated string, despite its
-        // mutable pointer signature, and retains neither the string nor its slot.
-        if unsafe { crate::xdr_wrapstring(self.0.as_raw(), &mut pointer) } {
-            Ok(())
-        } else {
-            Err(Error::OperationFailed)
-        }
+        self.encoder().encode_string(string)
+    }
+
+    /// Borrow this memory stream for the same safe operations used by RPC codecs.
+    /// The view excludes other operations on the owner until its last use:
+    ///
+    /// ```compile_fail
+    /// use libntirpc_sys::xdr::MemoryEncoder;
+    /// let mut memory = MemoryEncoder::new(4).unwrap();
+    /// let mut view = memory.encoder();
+    /// memory.reset();
+    /// view.encode_u32(1).unwrap();
+    /// ```
+    pub fn encoder(&mut self) -> XdrEncoder<'_> {
+        // SAFETY: The private stream owns stable live backing storage, is fixed
+        // in ENCODE mode, and is exclusively borrowed for the view's lifetime.
+        unsafe { XdrEncoder::from_raw(self.0.as_raw()) }.expect("private encode stream")
     }
 
     /// Start another encoding without allocating or clearing the buffer.
@@ -269,6 +392,12 @@ impl MemoryEncoder {
 /// println!("{view:?}"); // owned has already been freed
 /// ```
 pub struct XdrString(NonNull<c_char>);
+
+// SAFETY: This owner uniquely owns an independent ntirpc allocation. Moving it
+// transfers ownership without exposing mutation; the string does not borrow its
+// decoder or stream. ntirpc's allocator supports freeing on another thread, and
+// raw FFI users must preserve its hooks until every owned string is dropped.
+unsafe impl Send for XdrString {}
 
 impl XdrString {
     /// Borrow the decoded C string for this owner's lifetime.

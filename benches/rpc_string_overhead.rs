@@ -3,7 +3,7 @@
 //! Run separately from real network timing: bash tests/bench-rpc-string.sh.
 use libntirpc_sys::*;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::ffi::{c_char, c_void};
+use std::ffi::{CStr, c_char, c_void};
 use std::hint::black_box;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
@@ -86,16 +86,24 @@ extern "C" fn __wrap_svc_init(_params: *mut svc_init_params) -> bool {
 // SAFETY: This benchmark substitutes the exact rpc_call symbol/ABI from clnt.h.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn __wrap_rpc_call(
-    _host: *const c_char,
-    _program: rpcprog_t,
-    _version: rpcvers_t,
+    host: *const c_char,
+    program: rpcprog_t,
+    version: rpcvers_t,
     procedure: rpcproc_t,
     inproc: xdrproc_t,
     input: *const c_void,
     outproc: xdrproc_t,
     output: *mut c_void,
-    _transport: *const c_char,
+    transport: *const c_char,
 ) -> clnt_stat {
+    // SAFETY: The caller supplies readable, terminated endpoint strings for
+    // this synchronous invocation, just as required by the real rpc_call ABI.
+    unsafe {
+        assert_eq!(CStr::from_ptr(host), c"localhost");
+        assert_eq!(CStr::from_ptr(transport), c"udp");
+    }
+    assert_eq!(program, 1);
+    assert_eq!(version, 1);
     if procedure == 3 {
         return clnt_stat_RPC_SUCCESS;
     }
@@ -163,7 +171,31 @@ fn raw_call() -> xdr::XdrString {
 }
 
 fn safe_call() -> xdr::XdrString {
+    static CLIENT: OnceLock<client::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| client::Client::new(c"localhost", 1, 1, c"udp").unwrap())
+        .call::<client::WrapString<1>>(c"Alice")
+        .unwrap()
+}
+
+fn legacy_call() -> xdr::XdrString {
     client::call_string(c"localhost", 1, 1, 1, c"Alice", c"udp").unwrap()
+}
+
+struct Number;
+
+impl client::RpcCodec for Number {
+    const NUMBER: rpcproc_t = 7;
+    type Request = u32;
+    type Reply = u32;
+
+    fn encode(xdr: &mut xdr::XdrEncoder<'_>, value: &u32) -> Result<(), xdr::Error> {
+        xdr.encode_u32(*value)
+    }
+
+    fn decode(xdr: &mut xdr::XdrDecoder<'_>) -> Result<u32, xdr::Error> {
+        xdr.decode_u32()
+    }
 }
 
 fn measure(label: &str, operation: fn() -> xdr::XdrString) {
@@ -213,19 +245,26 @@ fn main() {
         __ntirpc_pkg_params.malloc_ = Some(count_malloc);
         __ntirpc_pkg_params.free_size_ = Some(count_free);
     }
+    let client = {
+        let host = c"localhost".to_owned();
+        let transport = c"udp".to_owned();
+        client::Client::new(&host, 1, 1, &transport).unwrap()
+    }; // The client's configuration outlives the original endpoint names.
+    assert_eq!(client.call::<Number>(&0x0102_0304), Ok(0x0102_0304));
     // Verify cleanup when RPC reports failure after successfully decoding.
     COUNT.store(true, Relaxed);
     assert!(matches!(
-        client::call_string(c"localhost", 1, 1, 2, c"Alice", c"udp"),
+        client.call::<client::WrapString<2>>(c"Alice"),
         Err(client::Error::CallFailed(status)) if status == clnt_stat_RPC_FAILED
     ));
     COUNT.store(false, Relaxed);
     assert_eq!(NATIVE_ALLOCS.load(Relaxed), 1);
     assert_eq!(NATIVE_FREES.load(Relaxed), 1);
     assert!(matches!(
-        client::call_string(c"localhost", 1, 1, 3, c"Alice", c"udp"),
+        client.call::<client::WrapString<3>>(c"Alice"),
         Err(client::Error::MissingResult)
     ));
     measure("raw RPC boundary", raw_call);
-    measure("safe RPC boundary", safe_call);
+    measure("typed client RPC boundary", safe_call);
+    measure("legacy string RPC boundary", legacy_call);
 }
