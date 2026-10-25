@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Backport reviewed upstream transport lock/reference, epoll teardown,
+  broadcast cleanup, and RPCSEC_GSS deadlock/leak fixes. Record source commits,
+  overlapping fixes, and excluded PRs in `vendor/PATCHES.md`.
+- Fix parent-scope CMake warnings while preserving the existing CMake minimum,
+  correct legacy man-page type markup, and add native failure-path regressions.
+
 ## 0.3.2
 
 - Fix XDR string ownership on decode failure, string allocation overflow,

@@ -23,3 +23,5 @@ Monitoring, LTTng, RDMA and TLS are disabled; IPv6 matches upstream defaults.
 RPCSEC_GSS is compiled only when the rpcsec-gss Cargo feature is enabled.
 
 Additional correctness patches are recorded in [PATCHES.md](PATCHES.md).
+Reviewed open upstream PR commits are backported on top of this base pin;
+their exact revisions, adjustments, and exclusions are recorded there.
