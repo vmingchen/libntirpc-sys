@@ -191,7 +191,7 @@ void svc_rqst_rec_destroy(struct svc_rqst_rec *sr_rec)
 	}
 
 #if defined(TIRPC_EPOLL)
-	if (sr_rec->ev_u.epoll.epoll_fd > 0) {
+	if (sr_rec->ev_u.epoll.epoll_fd >= 0) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
 			"%s: sr_rec %p epoll_fd=%d close",
 			__func__, sr_rec, sr_rec->ev_u.epoll.epoll_fd);
@@ -1148,6 +1148,7 @@ svc_rqst_evchan_reg(uint32_t chan_id, SVCXPRT *xprt, uint32_t flags)
 		if (rec->ev_p == sr_rec) {
 			if (!(flags & RPC_DPLX_LOCKED))
 				rpc_dplx_rui(rec);
+			svc_rqst_release(sr_rec);
 			__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
 				"%s: %p already registered evchan %d",
 				__func__, xprt, chan_id);
