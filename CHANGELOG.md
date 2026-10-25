@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add separate allocation and throughput benchmarks, native/Rust allocation
+  accounting, and state-machine fuzzing with native/Rust ASan coverage and leak
+  detection. Gate allocation invariants and bounded fuzz campaigns in CI.
 - Borrow encoded XDR output without copying, reuse encoder/decoder allocations
   through reset/rewind/refill, and copy each fuzz input once for all decoders.
 - Add safe memory XDR string encoders/decoders and an owning `XdrString` that

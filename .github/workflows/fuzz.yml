@@ -1,0 +1,32 @@
+name: Sanitized XDR fuzzing
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # toolchain action
+        with:
+          toolchain: nightly
+          components: rust-src, rustfmt
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake clang libclang-dev pkg-config liburcu-dev ripgrep
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: fuzz -> ../target/fuzz-asan
+      - run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - name: Fuzz Rust and native C with ASan and leak detection
+        run: bash tests/fuzz-xdr.sh 30
+      - name: Preserve crash inputs and corpus
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xdr-fuzz-failure
+          path: |
+            fuzz/artifacts
+            fuzz/corpus
+          if-no-files-found: ignore

@@ -20,6 +20,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMAKE_TOOLCHAIN_FILE");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS");
+    println!("cargo:rerun-if-env-changed=LIBNTIRPC_SYS_FUZZ_NATIVE");
     if env::var_os("DOCS_RS").is_some() {
         std::fs::copy("src/bindings-docs.rs", out.join("bindings.rs")).expect("docs bindings");
         println!("cargo:rerun-if-changed=src/bindings-docs.rs");
@@ -38,12 +39,29 @@ fn main() {
         "cross compilation requires CMAKE_TOOLCHAIN_FILE and target dependency packages"
     );
     let gss = env::var_os("CARGO_FEATURE_RPCSEC_GSS").is_some();
-    let build = out.join("bundled-build");
-    let source = out.join("native-src");
+    let fuzz_native = env::var_os("LIBNTIRPC_SYS_FUZZ_NATIVE").is_some();
+    if fuzz_native {
+        assert!(
+            env::var_os("CARGO_FEATURE_FUZZING").is_some() && target == host,
+            "native fuzz instrumentation requires the fuzzing feature and a host build"
+        );
+        println!(
+            "cargo:warning=Building native ntirpc with AddressSanitizer and libFuzzer coverage"
+        );
+    }
+    // Keep sanitizer flags/compiler settings out of the normal CMake cache,
+    // including when instrumentation is toggled in the same Cargo target dir.
+    let native_out = if fuzz_native {
+        out.join("fuzz-native")
+    } else {
+        out.clone()
+    };
+    let build = native_out.join("bundled-build");
+    let source = native_out.join("native-src");
     // Upstream CMake generates libntirpc.spec in its source tree. Never let
     // that mutate a Cargo registry/package checkout or the maintained source.
     copy_tree(std::path::Path::new("vendor/ntirpc"), &source);
-    let prefix = out.join("native-install");
+    let prefix = native_out.join("native-install");
     let mut configure = Command::new("cmake");
     configure
         .arg("-S")
@@ -66,6 +84,12 @@ fn main() {
             "-DCMAKE_TOOLCHAIN_FILE={}",
             PathBuf::from(path).display()
         ));
+    }
+    if fuzz_native {
+        configure.args([
+            "-DCMAKE_C_COMPILER=clang",
+            "-DCMAKE_C_FLAGS=-fsanitize=address,fuzzer-no-link -fno-omit-frame-pointer -g",
+        ]);
     }
     run(&mut configure);
     run(Command::new("cmake")
@@ -96,6 +120,13 @@ fn main() {
         for path in library.include_paths {
             helper.include(path);
         }
+    }
+    if fuzz_native {
+        helper
+            .compiler("clang")
+            .flag("-fsanitize=address,fuzzer-no-link")
+            .flag("-fno-omit-frame-pointer")
+            .debug(true);
     }
     helper.compile("ntirpc_helpers");
     println!(

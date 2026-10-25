@@ -1,0 +1,29 @@
+[package]
+name = "libntirpc-sys-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+libntirpc-sys = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "xdr_state"
+path = "fuzz_targets/xdr_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_xdr"
+path = "fuzz_targets/rpc_xdr.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -64,6 +64,16 @@ libc = "0.2"
 name = "source_contract"
 path = "tests/source_contract.rs"
 
+[[bench]]
+name = "xdr_throughput"
+path = "benches/xdr_throughput.rs"
+harness = false
+
+[[bench]]
+name = "xdr_allocations"
+path = "benches/xdr_allocations.rs"
+harness = false
+
 [build-dependencies]
 cc = "1"
 bindgen = { version = "=0.73.2", default-features = false, features = ["runtime"] }

@@ -138,6 +138,12 @@ docs.rs uses checked-in declarations and skips the native build.
 
 ## Testing and ownership
 
+Reproducible allocation/throughput benchmarks are documented in
+[benches/README.md](benches/README.md). Stateful refill/reset/failure-recovery
+fuzzing instruments both Rust and bundled C with AddressSanitizer and leak
+detection; see [fuzz/README.md](fuzz/README.md) and run
+`bash tests/fuzz-xdr.sh 30` for a bounded campaign.
+
 Handwritten Rust must document every unsafe block with a `// SAFETY:` comment
 that explains pointer validity, ownership, lifetimes, synchronization, and other
 relevant assumptions. Unsafe functions, including private callbacks, need a
