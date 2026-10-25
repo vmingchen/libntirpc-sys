@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix an IPv4 broadcast address overread and initialize broadcast address
+  storage, with native IPv4/IPv6 regression coverage.
+- Select stable Rust explicitly in the main CI job.
+- Remove deleted vendored sources from incremental native builds using a source
+  manifest, preserving generated files and unchanged source timestamps.
 - Add separate allocation and throughput benchmarks, native/Rust allocation
   accounting, and state-machine fuzzing with native/Rust ASan coverage and leak
   detection. Gate allocation invariants and bounded fuzz campaigns in CI.

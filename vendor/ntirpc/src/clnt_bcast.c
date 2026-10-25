@@ -147,17 +147,12 @@ __rpc_getbroadifs(int af, int proto, int socktype, broadlist_t *list)
 		    || !(ifap->ifa_flags & IFF_UP))
 			continue;
 		bip = (struct broadif *)mem_alloc(sizeof(*bip));
+		memset(&bip->broadaddr, 0, sizeof(bip->broadaddr));
 		bip->index = if_nametoindex(ifap->ifa_name);
-		if (
-#ifdef INET6
-			   af != AF_INET6 &&
-#endif
-			   (ifap->ifa_flags & IFF_BROADCAST)
-			   && ifap->ifa_broadaddr) {
-			/* memcpy(&bip->broadaddr, ifap->ifa_broadaddr,
-			   (size_t)ifap->ifa_broadaddr->sa_len); */
+		if (af == AF_INET && (ifap->ifa_flags & IFF_BROADCAST)
+		    && ifap->ifa_broadaddr) {
 			memcpy(&bip->broadaddr, ifap->ifa_broadaddr,
-			       sizeof(bip->broadaddr));
+			       sizeof(struct sockaddr_in));
 			sin = (struct sockaddr_in *)(void *)&bip->broadaddr;
 			sin->sin_port = ((struct sockaddr_in *)
 					 (void *)res->ai_addr)->sin_port;

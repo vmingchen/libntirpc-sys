@@ -3,6 +3,12 @@
 These changes apply to the bundled NTIRPC source and its installed headers.
 Keep the behavioral regression tests when refreshing the upstream source.
 
+- `src/clnt_bcast.c`: copy only `sizeof(struct sockaddr_in)` from IPv4
+  broadcast addresses instead of reading a full `sockaddr_storage`. Zero the
+  destination storage so IPv6 flowinfo and unused address bytes are initialized.
+  Covered by exact-sized IPv4 allocations and poisoned IPv4/IPv6 destination
+  allocations in `tests/native_broadcast.c`.
+
 - `ntirpc/rpc/xdr_inline.h`: preserve caller-owned string storage when decoding
   fails. Free only storage allocated by that decode attempt. Covered by the
   string regressions in `tests/xdr.rs`.
