@@ -26,3 +26,14 @@ Keep the behavioral regression tests when refreshing the upstream source.
 - `ntirpc/rpc/xdr_inline.h`: reject a string length whose terminating NUL
   would overflow the allocation size. The allocator-counting boundary test
   in `tests/native_xdr.c` uses only a four-byte input.
+
+## Upstream PR review and backports (2026-10-25)
+
+Reviewed all 15 open PRs returned by GitHub's live API. The base source pin in
+[UPSTREAM.md](UPSTREAM.md) is unchanged. These are backports, not upstream merges;
+commit IDs below identify the reviewed revisions. Source license notices and
+authorship remain with the original commits.
+
+| PR | Reviewed commit(s) | Applied change and assessment |
+| --- | --- | --- |
+| [#418](https://github.com/nfs-ganesha/ntirpc/pull/418) | `4cb5ec589390226d1ad79225616a1e60d5280160` | Applied in full. Channel destruction owns the events allocation and epoll descriptor, including setup failures. Removes the loop's stale descriptor close and duplicate cleanup. Also frees worker state when `pthread_create` fails (part of this commit, although omitted from its PR description). |

@@ -15,5 +15,5 @@ for fixture in tests/native_*.c; do
     -I"$native_out/bundled-build" \
     "$fixture" "$native_out/native-install/lib/libntirpc.a" \
     "${dependency_flags[@]}" -lpthread -o "$executable"
-    "$executable"
+    timeout 30 "$executable"
 done
