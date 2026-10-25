@@ -1,0 +1,2 @@
+# Require safety contracts on private FFI callbacks as well as public APIs.
+check-private-items = true

@@ -7,7 +7,16 @@ struct Response {
     greeting: Option<String>,
 }
 
+/// Capture a reply while its temporary result storage is still live.
+///
+/// # Safety
+/// req must come from dispatch below, with rq_u1 pointing to its exclusive live
+/// Response. A successful greeting must point to the synchronous string result
+/// installed by hello_process; other replies must have matching discriminants.
 unsafe extern "C" fn record_reply(req: *mut svc_req) -> xprt_stat {
+    // SAFETY: dispatch owns req and Response and invokes hello_process
+    // synchronously. Check the reply discriminants before reading union arms;
+    // the success string is copied while its CString/pointer slot is live.
     unsafe {
         let response = &mut *((*req).rq_u1.cast::<Response>());
         response.calls += 1;
@@ -28,6 +37,11 @@ unsafe extern "C" fn record_reply(req: *mut svc_req) -> xprt_stat {
 }
 
 fn dispatch(program: u32, version: u32, procedure: u32, flavor: i32, complete: bool) -> Response {
+    // SAFETY: The zeroed values are C structs/unions of integers, raw pointers
+    // and nullable callbacks. Every field needed by hello_process is populated
+    // below. All pointees remain at stable stack addresses during the synchronous
+    // call; aligned wire covers the chosen length. record_reply copies results
+    // before their temporary storage goes away, and no worker is started.
     unsafe {
         let mut response = Response {
             calls: 0,
@@ -56,6 +70,15 @@ fn dispatch(program: u32, version: u32, procedure: u32, flavor: i32, complete: b
         request.rq_msg.cb_proc = procedure;
         request.rq_msg.cb_cred.oa_flavor = flavor;
         hello_process(&mut request);
+        // Results point into hello_process's former stack; the callback already
+        // copied the greeting. Clear them before returning the captured header.
+        if response.message.rm_direction == msg_type_REPLY
+            && response.message.ru.RM_rmb.rp_stat == reply_stat_MSG_ACCEPTED
+            && response.message.ru.RM_rmb.ru.RP_ar.ar_stat == accept_stat_SUCCESS
+        {
+            response.message.ru.RM_rmb.ru.RP_ar.ru.AR_results.proc_ = None;
+            response.message.ru.RM_rmb.ru.RP_ar.ru.AR_results.where_ = std::ptr::null_mut();
+        }
         response
     }
 }
@@ -64,10 +87,9 @@ fn assert_accepted(response: &Response, expected: accept_stat) {
     assert_eq!(response.calls, 1);
     assert_eq!(response.message.rm_direction, msg_type_REPLY);
     assert_eq!(response.message.ru.RM_rmb.rp_stat, reply_stat_MSG_ACCEPTED);
-    assert_eq!(
-        unsafe { response.message.ru.RM_rmb.ru.RP_ar.ar_stat },
-        expected
-    );
+    // SAFETY: The assertions above establish REPLY/MSG_ACCEPTED, selecting RP_ar.
+    let status = unsafe { response.message.ru.RM_rmb.ru.RP_ar.ar_stat };
+    assert_eq!(status, expected);
 }
 
 #[test]
@@ -99,6 +121,8 @@ fn unknown_program_reports_program_unavailable() {
 fn unsupported_version_reports_the_supported_range() {
     let response = dispatch(HELLO_PROG, HELLO_VERS + 1, 1, AUTH_NONE as i32, true);
     assert_accepted(&response, accept_stat_PROG_MISMATCH);
+    // SAFETY: assert_accepted verifies REPLY/MSG_ACCEPTED/PROG_MISMATCH,
+    // which selects the initialized AR_versions arm.
     let versions = unsafe { response.message.ru.RM_rmb.ru.RP_ar.ru.AR_versions };
     assert_eq!(versions.low, HELLO_VERS);
     assert_eq!(versions.high, HELLO_VERS);
@@ -117,7 +141,10 @@ fn rejected_authentication_produces_an_error_reply() {
     assert_eq!(response.calls, 1);
     assert_eq!(response.message.rm_direction, msg_type_REPLY);
     assert_eq!(response.message.ru.RM_rmb.rp_stat, reply_stat_MSG_DENIED);
+    // SAFETY: The assertions above establish REPLY/MSG_DENIED, selecting RP_dr.
     let rejected = unsafe { response.message.ru.RM_rmb.ru.RP_dr };
     assert_eq!(rejected.rj_stat, reject_stat_AUTH_ERROR);
-    assert_eq!(unsafe { rejected.ru.RJ_why }, auth_stat_AUTH_REJECTEDCRED);
+    // SAFETY: AUTH_ERROR above selects the initialized RJ_why arm.
+    let reason = unsafe { rejected.ru.RJ_why };
+    assert_eq!(reason, auth_stat_AUTH_REJECTEDCRED);
 }

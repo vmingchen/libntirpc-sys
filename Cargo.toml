@@ -32,6 +32,14 @@ autobenches = false
 [package.metadata.docs.rs]
 all-features = true
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_unsafe = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
 [features]
 default = []
 fuzzing = []

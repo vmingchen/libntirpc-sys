@@ -23,6 +23,10 @@ use libntirpc_sys::*;
 
 // Send `name`, receive the greeting (`wrap_string` adapts `xdr_wrapstring`
 // to the generic `xdrproc_t` signature; see examples/hello_client.rs).
+// SAFETY: ntirpc is initialized, host is a live C string, and the two arguments
+// point to string-pointer slots matching wrap_string. Input storage is readable
+// and NUL-terminated; the null result receives an owned decoded allocation.
+// All storage remains live until the synchronous call returns.
 let stat = unsafe {
     rpc_call(
         host.as_ptr(), HELLO_PROG, HELLO_VERS, HELLO_PROC,
@@ -97,6 +101,15 @@ sysroot arguments via `BINDGEN_EXTRA_CLANG_ARGS`; it is not yet validated.
 docs.rs uses checked-in declarations and skips the native build.
 
 ## Testing and ownership
+
+Handwritten Rust must document every unsafe block with a `// SAFETY:` comment
+that explains pointer validity, ownership, lifetimes, synchronization, and other
+relevant assumptions. Unsafe functions, including private callbacks, need a
+`# Safety` contract. Cargo denies `unsafe_op_in_unsafe_fn` and `unused_unsafe`;
+Clippy denies `undocumented_unsafe_blocks` and `missing_safety_doc`. CI checks
+all targets and features. Generator-specific exceptions are confined to the
+private bindings module, whose declarations are re-exported at the crate root;
+raw FFI callers must still uphold the bundled C API's requirements.
 
 This repository is the source of truth. vNFS consumes published crate releases
 or an explicit Cargo path override during coordinated development. Run

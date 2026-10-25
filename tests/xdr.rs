@@ -12,7 +12,11 @@ fn truncated_string_preserves_caller_storage() {
         let mut storage = [0x55u8; 8];
         let mut decoded = storage.as_mut_ptr().cast::<c_char>();
         let original = decoded;
+        // SAFETY: XDR is a C struct whose integer/pointer fields admit zero.
         let mut stream: XDR = unsafe { std::mem::zeroed() };
+        // SAFETY: wire is aligned and covers stream_len bytes; stream stays in
+        // place. decoded points into eight writable bytes owned by this test,
+        // sufficient for the declared three-byte string and its terminator.
         unsafe {
             xdrmem_ncreate(
                 &mut stream,
@@ -36,7 +40,11 @@ fn truncated_string_does_not_publish_a_new_allocation() {
     for stream_len in [4, 6, 7] {
         let mut wire = string_stream(3);
         let mut decoded = std::ptr::null_mut();
+        // SAFETY: XDR's C integer/pointer fields admit zero.
         let mut stream: XDR = unsafe { std::mem::zeroed() };
+        // SAFETY: The aligned wire/stream stay live and unmoved. decoded starts
+        // null, so the decoder owns and frees any allocation on failure; this
+        // test requires that it publish no pointer from the truncated input.
         unsafe {
             xdrmem_ncreate(
                 &mut stream,
@@ -56,7 +64,11 @@ fn complete_string_reuses_caller_storage() {
     let mut storage = [0x55u8; 8];
     let mut decoded = storage.as_mut_ptr().cast::<c_char>();
     let original = decoded;
+    // SAFETY: XDR's C integer/pointer fields admit zero.
     let mut stream: XDR = unsafe { std::mem::zeroed() };
+    // SAFETY: wire is aligned and contains eight initialized bytes. decoded
+    // points to eight writable bytes; decoding needs four and retains neither
+    // pointer beyond this call. The stack allocations remain live and unmoved.
     unsafe {
         xdrmem_ncreate(&mut stream, wire.as_mut_ptr().cast(), 8, xdr_op_XDR_DECODE);
         assert!(xdr_wrapstring(&mut stream, &mut decoded));
@@ -76,6 +88,8 @@ fn append_auth(wire: &mut Vec<u8>, flavor: u32, body: &[u8]) {
 fn call_encoder_initializes_authentication_padding() {
     for cred_len in [0, 1, 2, 3, 4, 399, 400] {
         for verf_len in [0, 1, 2, 3, 4, 399, 400] {
+            // SAFETY: rpc_msg's C integers, pointers, and unions admit zero;
+            // the CALL arm and bounded inline auth bodies are populated below.
             let mut message: rpc_msg = unsafe { std::mem::zeroed() };
             message.rm_xid = 123;
             message.rm_direction = msg_type_CALL;
@@ -98,7 +112,11 @@ fn call_encoder_initializes_authentication_padding() {
             append_auth(&mut expected, 6, &vec![0x22; verf_len as usize]);
 
             let mut storage = [0xabab_ababu32; 256];
+            // SAFETY: XDR's C integer/pointer fields admit zero.
             let mut stream: XDR = unsafe { std::mem::zeroed() };
+            // SAFETY: Aligned storage has room for the entire bounded message;
+            // both it and stream stay live/unmoved. The CALL arm is initialized
+            // and encoding only reads message's inline auth bodies.
             unsafe {
                 xdrmem_ncreate(
                     &mut stream,
@@ -108,9 +126,11 @@ fn call_encoder_initializes_authentication_padding() {
                 );
                 assert!(xdr_ncallmsg(&mut stream, &mut message));
             }
-            let actual = unsafe {
-                std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), expected.len())
-            };
+            let actual: Vec<_> = storage
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .take(expected.len())
+                .collect();
             assert_eq!(
                 actual, expected,
                 "credential={cred_len}, verifier={verf_len}"
@@ -122,11 +142,14 @@ fn call_encoder_initializes_authentication_padding() {
 #[test]
 fn reply_encoder_initializes_verifier_padding() {
     for verifier_len in [0, 1, 2, 3, 4, 399, 400] {
+        // SAFETY: rpc_msg's C integer, pointer and union fields admit zero;
+        // initialize its REPLY/MSG_ACCEPTED arm before encoding below.
         let mut message: rpc_msg = unsafe { std::mem::zeroed() };
         message.rm_xid = 123;
         message.rm_direction = msg_type_REPLY;
         message.ru.RM_rmb.rp_stat = reply_stat_MSG_ACCEPTED;
-        // The zeroed union is initialized as MSG_ACCEPTED above.
+        // SAFETY: The initialized discriminants select REPLY/MSG_ACCEPTED,
+        // and this exclusive borrow does not overlap any other union access.
         let accepted = unsafe { &mut message.ru.RM_rmb.ru.RP_ar };
         accepted.ar_stat = accept_stat_SUCCESS;
         accepted.ar_verf.oa_flavor = 6;
@@ -140,7 +163,11 @@ fn reply_encoder_initializes_verifier_padding() {
         expected.extend_from_slice(&0u32.to_be_bytes());
 
         let mut storage = [0xabab_ababu32; 128];
+        // SAFETY: XDR's C integer/pointer fields admit zero.
         let mut stream: XDR = unsafe { std::mem::zeroed() };
+        // SAFETY: The aligned storage covers the bounded reply and stays live
+        // with stream. The accepted reply arm is initialized; the null optional
+        // result callback encodes no result and all auth data is inline.
         unsafe {
             xdrmem_ncreate(
                 &mut stream,
@@ -150,8 +177,11 @@ fn reply_encoder_initializes_verifier_padding() {
             );
             assert!(xdr_dplx_msg(&mut stream, &mut message));
         }
-        let actual =
-            unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), expected.len()) };
+        let actual: Vec<_> = storage
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .take(expected.len())
+            .collect();
         assert_eq!(actual, expected, "verifier={verifier_len}");
     }
 }

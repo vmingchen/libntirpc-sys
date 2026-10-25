@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Enforce unsafe block comments and unsafe function contracts, with generated
+  binding exceptions confined to their own module.
+- Keep fuzzing XDR stream self-pointers stable, avoid raw byte-slice casts and
+  shared mutable free streams, and document FFI ownership and lifetime rules.
+- Use Rust-owned request allocations and safe UDP socket setup in the examples;
+  install server callbacks before enabling event dispatch and free decoded
+  strings through ntirpc's allocator.
+
 ## 0.3.3
 
 - Backport reviewed upstream transport lock/reference, epoll teardown,
