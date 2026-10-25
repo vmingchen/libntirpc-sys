@@ -24,7 +24,7 @@ const HELLO_PROG: rpcprog_t = 0x3000_0001;
 const HELLO_VERS: rpcvers_t = 1;
 
 mod support;
-use support::{free_string, svc_req_alloc, svc_req_free, wrap_string};
+use support::{svc_req_alloc, svc_req_free, wrap_string};
 
 /// The dispatch registered with `svc_reg` is only used for bookkeeping;
 /// ntirpc never calls it (requests go to `process_cb` instead).
@@ -83,14 +83,12 @@ unsafe extern "C" fn hello_process(req: *mut svc_req) -> xprt_stat {
             _ => return svcerr_noproc(req),
         }
 
-        let mut name: *mut c_char = std::ptr::null_mut();
-
-        if !xdr_wrapstring((*req).rq_xdrs, &mut name) {
-            return svcerr_decode(req);
-        }
-        let name_c = std::ffi::CStr::from_ptr(name);
-        let reply_c = CString::new(format!("Hello, {}!", name_c.to_string_lossy())).unwrap();
-        free_string(&mut name);
+        let name = match xdr::XdrString::decode_from_raw((*req).rq_xdrs) {
+            Ok(name) => name,
+            Err(_) => return svcerr_decode(req),
+        };
+        let reply_c =
+            CString::new(format!("Hello, {}!", name.as_c_str().to_string_lossy())).unwrap();
 
         // Prepare the reply. svc_sendreply() encodes the result synchronously,
         // so pointing at the reply string on the stack is fine.

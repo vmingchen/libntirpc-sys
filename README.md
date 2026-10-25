@@ -69,6 +69,42 @@ cargo run --example hello_client -- Alice 127.0.0.1
 which prints `Hello, Alice!`. Both arguments are optional (`name` defaults to
 `world`, `host` to `127.0.0.1`).
 
+## Safe XDR strings
+
+For memory-backed XDR strings, `xdr::MemoryEncoder` and `xdr::MemoryDecoder`
+provide safe operations with owned, aligned buffers and fixed stream modes:
+
+```rust
+use libntirpc_sys::xdr::{MemoryDecoder, MemoryEncoder};
+
+let mut encoder = MemoryEncoder::new(32)?;
+encoder.encode_string(c"hello")?;
+let mut decoder = MemoryDecoder::new(encoder.as_bytes())?;
+let text = decoder.decode_string()?;
+assert_eq!(text.as_c_str(), c"hello");
+```
+
+Decoded `XdrString` values own their ntirpc allocation and free it on drop;
+their borrowed `CStr` views cannot outlive them. Encoding borrows a `CStr`
+without taking ownership. Strings need not be UTF-8 and retain C's semantics
+for embedded NUL bytes. Failures may advance the stream cursor.
+
+`encoder.as_bytes()` borrows output without allocating or copying; use
+`encoder.as_bytes().to_vec()` when an independent owned copy is needed.
+`encoder.reset()` reuses the output allocation, while `decoder.rewind()` reads the same input
+again without a copy. `decoder.refill(bytes)` copies a new input into retained
+storage and allocates only when its capacity must grow. Decoded strings remain
+valid across resets, refills, and destruction of their decoder. The fuzz adapter
+copies each input once and rewinds that decoder for all three decoding passes.
+
+Network callbacks still require an unsafe boundary: `XdrString::decode_from_raw`
+requires a valid, exclusively accessed XDR stream with live backing storage and
+correct callbacks. `XdrString::from_raw` requires unique ownership of a valid
+ntirpc allocation. An arbitrary `*mut XDR` or `char **` cannot prove these
+properties, and `xdr_wrapstring` can encode, allocate into, overwrite, or free
+its argument depending on the stream mode. Use the typed memory wrappers when
+possible; raw FFI callbacks retain their explicit safety contracts.
+
 ## Native build
 
 Normal Cargo builds compile the packaged ntirpc source based on v15.7 at commit

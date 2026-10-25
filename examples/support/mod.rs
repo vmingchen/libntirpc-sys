@@ -37,17 +37,3 @@ pub(super) unsafe extern "C" fn svc_req_free(req: *mut svc_req, _stat: xprt_stat
     // created above; svc_req's pointer fields have no Rust-owned destructors.
     unsafe { drop(Box::from_raw(req)) }
 }
-
-/// Free a decoded string through ntirpc's matching allocator.
-///
-/// # Safety
-/// `string` must be null or a live NUL-terminated allocation returned by ntirpc's
-/// string decoder, owned exclusively by the caller and not previously freed.
-pub(super) unsafe fn free_string(string: &mut *mut c_char) {
-    // SAFETY: XDR's C fields admit zero. Only x_op is used by XDR_FREE.
-    let mut stream: XDR = unsafe { std::mem::zeroed() };
-    stream.x_op = xdr_op_XDR_FREE;
-    // SAFETY: The caller transfers the decoded allocation to ntirpc's own
-    // XDR_FREE path, which frees it and clears the output pointer.
-    unsafe { xdr_wrapstring(&mut stream, string) };
-}

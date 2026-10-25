@@ -7,7 +7,7 @@
 //! cargo run --example hello_client -- [name] [host]
 //! ```
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 
 use libntirpc_sys::*;
@@ -17,7 +17,7 @@ const HELLO_VERS: rpcvers_t = 1;
 const HELLO_PROC: rpcproc_t = 1;
 
 mod support;
-use support::{free_string, svc_req_alloc, svc_req_free, wrap_string};
+use support::{svc_req_alloc, svc_req_free, wrap_string};
 
 fn main() {
     let name = std::env::args()
@@ -81,12 +81,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    assert!(!result.is_null(), "successful string decode returned NULL");
-    // SAFETY: Successful xdr_wrapstring decoding returns a NUL-terminated
-    // allocation. It remains owned here and live until free_string below.
-    let reply = unsafe { CStr::from_ptr(result) };
-    println!("{}", reply.to_string_lossy());
-    // SAFETY: The synchronous RPC is finished and result is its exclusively
-    // owned decoded string, with no remaining readers.
-    unsafe { free_string(&mut result) };
+    // SAFETY: The successful synchronous RPC returned a NUL-terminated ntirpc
+    // allocation, owned exclusively here. XdrString takes over its deallocation.
+    let reply = unsafe { xdr::XdrString::from_raw(result) }
+        .expect("successful string decode returned NULL");
+    println!("{}", reply.as_c_str().to_string_lossy());
 }

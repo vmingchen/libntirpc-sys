@@ -17,6 +17,8 @@ pub use bindings::*;
 #[allow(non_camel_case_types)]
 pub type rpcblist = rp__list;
 
+pub mod xdr;
+
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 
@@ -115,47 +117,14 @@ mod test {
 
     #[test]
     fn memory_xdr_encodes_decodes_and_frees_a_string() {
-        let input = std::ffi::CString::new("abc").unwrap();
-        let mut pointer = input.as_ptr() as *mut std::os::raw::c_char;
-        let mut storage = [0_u32; 2];
-        // SAFETY: XDR's C integers and raw pointers admit zero; xdrmem_ncreate
-        // initializes its operational fields before any encoding or decoding.
-        let mut stream: XDR = unsafe { std::mem::zeroed() };
-        // SAFETY: storage is aligned and writable for all eight bytes and stays
-        // live/unmoved with stream. XDR_ENCODE only reads the CString and retains
-        // no string pointer. The output pointer for decoding starts null.
-        unsafe {
-            xdrmem_ncreate(
-                &mut stream,
-                storage.as_mut_ptr().cast(),
-                8,
-                xdr_op_XDR_ENCODE,
-            );
-            assert!(xdr_wrapstring(&mut stream, &mut pointer));
-        }
-        let bytes: Vec<_> = storage.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        let mut encoder = xdr::MemoryEncoder::new(8).unwrap();
+        encoder.encode_string(c"abc").unwrap();
+        let bytes = encoder.as_bytes().to_vec();
         assert_eq!(bytes, [0, 0, 0, 3, b'a', b'b', b'c', 0]);
-        // SAFETY: The same aligned storage remains live. Successful decoding
-        // supplies a NUL-terminated allocation owned by this test; XDR_FREE uses
-        // the matching ntirpc allocator once. Only x_op is read by XDR_FREE.
-        unsafe {
-            xdrmem_ncreate(
-                &mut stream,
-                storage.as_mut_ptr().cast(),
-                8,
-                xdr_op_XDR_DECODE,
-            );
-            let mut decoded = std::ptr::null_mut();
-            assert!(xdr_wrapstring(&mut stream, &mut decoded));
-            assert_eq!(std::ffi::CStr::from_ptr(decoded), input.as_c_str());
-            let mut freeing: XDR = std::mem::zeroed();
-            freeing.x_op = xdr_op_XDR_FREE;
-            assert!(xdr_wrapstring(&mut freeing, &mut decoded));
-            assert!(
-                decoded.is_null(),
-                "XDR_FREE must release and clear the allocation"
-            );
-        }
+        let mut decoder = xdr::MemoryDecoder::new(&bytes).unwrap();
+        let decoded = decoder.decode_string().unwrap();
+        assert_eq!(decoded.as_c_str(), c"abc");
+        drop(decoded); // Matching ntirpc deallocation is handled by the owner.
     }
 
     /// The bindgen invocation and the C shims must compile `SVCXPRT` with the

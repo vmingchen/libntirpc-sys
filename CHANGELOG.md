@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Borrow encoded XDR output without copying, reuse encoder/decoder allocations
+  through reset/rewind/refill, and copy each fuzz input once for all decoders.
+- Add safe memory XDR string encoders/decoders and an owning `XdrString` that
+  frees with ntirpc's allocator; reuse them in fuzzing and hello examples.
 - Enforce unsafe block comments and unsafe function contracts, with generated
   binding exceptions confined to their own module.
 - Keep fuzzing XDR stream self-pointers stable, avoid raw byte-slice casts and
