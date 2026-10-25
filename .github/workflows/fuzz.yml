@@ -17,9 +17,9 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: fuzz -> ../target/fuzz-asan
-      # The published lockfile for 0.13.1 pins rustix 0.36.5, which current
-      # nightly rejects because it uses reserved rustc attributes.
-      - run: cargo install cargo-fuzz --version 0.13.1
+      # Version 0.13.1 pulls rustix 0.36.5, which current nightly rejects
+      # because it uses reserved rustc attributes.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
       - name: Fuzz Rust and native C with ASan and leak detection
         run: bash tests/fuzz-xdr.sh 30
